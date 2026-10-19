@@ -93,4 +93,4 @@ python3 test_herdr_notify.py
 
 ## License
 
-MIT
+[MIT](LICENSE)
