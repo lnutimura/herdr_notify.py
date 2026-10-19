@@ -25,16 +25,17 @@ position = "bottom-right"
 
 `delivery = "herdr"` draws the toast inside the Herdr window, which is the one you can see from another tab. Use `system` instead when the alert must also appear after you leave the terminal entirely. That needs a desktop notification daemon on Linux. Reload the config with `herdr server reload-config`.
 
-2. Put `herdr_notify.py` in the autoload directory of the WeeChat home you already use:
+2. Link the script into WeeChat's Python autoload directory.
 
-- `~/.weechat/python/autoload/` when that directory exists
-- `~/.config/weechat/python/autoload/` when WeeChat is using the XDG home
+Scripts live in the data directory. With the default XDG layout that is `~/.local/share/weechat/python/` (`$XDG_DATA_HOME/weechat/python` when that variable is set). `~/.config/weechat` holds the `*.conf` files only.
 
 ```bash
-# from a clone of this repository; change the destination if your WeeChat home differs
-mkdir -p ~/.weechat/python/autoload
-ln -sf "$PWD/herdr_notify.py" ~/.weechat/python/autoload/herdr_notify.py
+# from a clone of this repository
+mkdir -p ~/.local/share/weechat/python/autoload
+ln -sf "$PWD/herdr_notify.py" ~/.local/share/weechat/python/autoload/herdr_notify.py
 ```
+
+If WeeChat was started with `-d` / `--dir` or `WEECHAT_HOME`, or it is still using an old home because `~/.weechat/weechat.conf` exists and `~/.config/weechat/weechat.conf` does not, put the link in that home's `python/autoload` directory instead. `/debug dirs` prints the data directory this WeeChat is using.
 
 3. Start WeeChat from a Herdr pane, or `/script reload herdr_notify` in a WeeChat that is already running there.
 
