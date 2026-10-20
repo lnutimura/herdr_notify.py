@@ -151,13 +151,17 @@ class NotifierTests(unittest.TestCase):
         self.assertEqual(notify.backend_name("terminal-notifier", "darwin", binary, True), "herdr")
 
     def test_finds_homebrew_notifier_when_path_misses_it(self):
+        bundle = (
+            "/opt/homebrew/Cellar/terminal-notifier/3.1.0/"
+            "terminal-notifier.app/Contents/MacOS/terminal-notifier"
+        )
         self.assertEqual(
             notify.find_notifier("linux", lambda _name: "/usr/bin/terminal-notifier", lambda _path: True),
             "",
         )
         self.assertEqual(
             notify.find_notifier("darwin", lambda _name: "/custom/terminal-notifier", lambda _path: False),
-            "/custom/terminal-notifier",
+            "",
         )
         self.assertEqual(
             notify.find_notifier(
@@ -166,6 +170,15 @@ class NotifierTests(unittest.TestCase):
                 lambda path: path == "/opt/homebrew/bin/terminal-notifier",
             ),
             "/opt/homebrew/bin/terminal-notifier",
+        )
+        self.assertEqual(
+            notify.find_notifier(
+                "darwin",
+                lambda _name: "/opt/homebrew/bin/terminal-notifier",
+                lambda path: path in (bundle, "/opt/homebrew/bin/terminal-notifier"),
+                [bundle],
+            ),
+            bundle,
         )
 
     def test_terminal_bundle(self):
@@ -182,6 +195,7 @@ class NotifierTests(unittest.TestCase):
 
     def test_plist_looking_title_is_escaped(self):
         self.assertEqual(notify.notifier_text("[hi]"), "\\[hi]")
+        self.assertEqual(notify.notifier_text("-bot"), "\\-bot")
         self.assertEqual(notify.notifier_text("ada"), "ada")
 
     def test_arguments_keep_the_message_out_of_the_click_command(self):
@@ -194,14 +208,14 @@ class NotifierTests(unittest.TestCase):
             "com.mitchellh.ghostty",
             click,
         )
-        execute = next(arg for arg in args if arg.startswith("-execute="))
-        message = next(arg for arg in args if arg.startswith("-message="))
+        execute = args[args.index("-execute") + 1]
         self.assertNotIn("rm -rf", execute)
-        self.assertIn("hello; rm -rf /", message)
-        self.assertIn("-title=\\[ada] in #chan", args)
-        self.assertIn("-activate=com.mitchellh.ghostty", args)
-        self.assertIn("-sound=Ping", args)
-        self.assertIn("-group=herdr-notify-w1-p3", args)
+        self.assertEqual(args[args.index("-message") + 1], "hello; rm -rf /")
+        self.assertEqual(args[args.index("-title") + 1], "\\[ada] in #chan")
+        self.assertEqual(args[args.index("-activate") + 1], "com.mitchellh.ghostty")
+        self.assertEqual(args[args.index("-sound") + 1], "Ping")
+        self.assertEqual(args[args.index("-group") + 1], "herdr-notify-w1-p3")
+        self.assertNotIn("-message=hello; rm -rf /", args)
 
     def test_group_id_is_safe(self):
         self.assertEqual(notify.notification_group("w1:p3"), "herdr-notify-w1-p3")

@@ -19,7 +19,7 @@ WeeChat's own hotlist does not record that case, and Herdr does not notify for o
 brew install terminal-notifier
 ```
 
-The script looks on `PATH`, then in `/opt/homebrew/bin` and `/usr/local/bin`. Skip this step on Linux.
+The script runs the binary inside `terminal-notifier.app` (Homebrew's Cellar, or an app in `/Applications` or `~/Applications`). A copy that only lives on `PATH` is a different program to Notification Center. Skip this step on Linux.
 
 2. Allow Herdr toasts. Linux always uses them. macOS uses them when `terminal-notifier` is missing or Notification Center has blocked it. In the Herdr config (`~/.config/herdr/config.toml`):
 

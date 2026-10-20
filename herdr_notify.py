@@ -37,6 +37,7 @@
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import shutil
@@ -95,6 +96,14 @@ NOTIFIER_CANDIDATES = (
     "/opt/homebrew/bin/terminal-notifier",
     "/usr/local/bin/terminal-notifier",
 )
+NOTIFIER_APP_GLOBS = (
+    "/opt/homebrew/opt/terminal-notifier/terminal-notifier.app/Contents/MacOS/terminal-notifier",
+    "/usr/local/opt/terminal-notifier/terminal-notifier.app/Contents/MacOS/terminal-notifier",
+    "/opt/homebrew/Cellar/terminal-notifier/*/terminal-notifier.app/Contents/MacOS/terminal-notifier",
+    "/usr/local/Cellar/terminal-notifier/*/terminal-notifier.app/Contents/MacOS/terminal-notifier",
+    "~/Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier",
+    "/Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier",
+)
 NOTIFIER_MISSING = (
     "terminal-notifier was not found. Notifications will use Herdr toasts. "
     "Install it with: brew install terminal-notifier"
@@ -125,6 +134,7 @@ notify_failures = 0
 focus_failures = 0
 inflight_ids = []
 inflight_backend = ""
+notifier_chunks = {"out": "", "err": ""}
 prefer_herdr = False
 give_up = False
 beep_suspended = False
@@ -375,23 +385,45 @@ def backend_name(delivery, platform, binary, fallback):
     return "herdr"
 
 
-def find_notifier(platform, which, usable):
+def find_notifier(platform, which, usable, bundles=()):
+    """Prefer the binary inside terminal-notifier.app. A loose copy is a different app to macOS."""
     if platform != "darwin":
         return ""
     found = which("terminal-notifier") if which else ""
-    if found:
-        return found
-    for path in NOTIFIER_CANDIDATES:
+    resolved = os.path.realpath(found) if found else ""
+    app_paths = []
+    other_paths = []
+    if "terminal-notifier.app" in resolved:
+        app_paths.append(resolved)
+    elif found:
+        other_paths.append(found)
+    for path in list(bundles) + list(NOTIFIER_CANDIDATES):
+        if "terminal-notifier.app" in path:
+            app_paths.append(path)
+        else:
+            other_paths.append(path)
+    seen = set()
+    for path in app_paths + other_paths:
+        if not path or path in seen:
+            continue
+        seen.add(path)
         if usable(path):
             return path
     return ""
+
+
+def bundled_notifier_paths():
+    found = []
+    for pattern in NOTIFIER_APP_GLOBS:
+        found.extend(sorted(glob.glob(os.path.expanduser(pattern))))
+    return found
 
 
 def notifier_path():
     def usable(path):
         return os.path.isfile(path) and os.access(path, os.X_OK)
 
-    return find_notifier(sys.platform, shutil.which, usable)
+    return find_notifier(sys.platform, shutil.which, usable, bundled_notifier_paths())
 
 
 def detect_terminal_bundle(environ):
@@ -419,9 +451,9 @@ def macos_sound(name):
 
 
 def notifier_text(text):
-    """terminal-notifier misreads a value whose first character looks like a plist."""
+    """NSUserDefaults misreads a value whose first character looks like a plist or a flag."""
     value = "" if text is None else str(text)
-    if value[:1] in "[{(\"'":
+    if value[:1] in "[{(\"'\\-":
         return "\\" + value
     return value
 
@@ -486,18 +518,19 @@ def focus_command(python, socket_path, pane_id):
 
 
 def notifier_arguments(title, body, sound, group, bundle, execute):
+    """Flags and values are separate argv entries. `-message=text` is not a `-message`."""
     shown = title or "WeeChat"
-    args = [
-        "-title=" + notifier_text(shown),
-        "-message=" + notifier_text(body or shown),
-        "-group=" + group,
-    ]
+
+    def option(flag, value):
+        return ["-" + flag, notifier_text(value)]
+
+    args = option("title", shown) + option("message", body or shown) + option("group", group)
     if sound:
-        args.append("-sound=" + sound)
+        args.extend(option("sound", sound))
     if bundle:
-        args.append("-activate=" + bundle)
+        args.extend(option("activate", bundle))
     if execute:
-        args.append("-execute=" + execute)
+        args.extend(option("execute", execute))
     return args
 
 
@@ -509,8 +542,8 @@ def herdr_notify_args(title, body, sound):
     return args
 
 
-def notifier_problem(code, err):
-    detail = " ".join((err or "").split())
+def notifier_problem(code, err, out=""):
+    detail = " ".join(((err or "") + "\n" + (out or "")).split())
     if len(detail) > 200:
         detail = detail[:199].rstrip() + "…"
     if detail:
@@ -797,6 +830,8 @@ def start_notify(events):
     body = choose_body(events)
     backend, command, args = notify_invocation(title, body, choose_sound(events))
     inflight_backend = backend
+    notifier_chunks["out"] = ""
+    notifier_chunks["err"] = ""
     inflight_ids = [event.id for event in events]
     hook = start_process(command, args, "notify_cb")
     if hook:
@@ -916,7 +951,7 @@ def exit_code(return_code):
         return 1
 
 
-def notifier_finished(status, return_code, err):
+def notifier_finished(status, return_code, err, out=""):
     """A terminal-notifier failure falls back to Herdr toasts. The events stay queued."""
     global prefer_herdr, notify_failures, next_attempt
     if status != "error":
@@ -935,20 +970,27 @@ def notifier_finished(status, return_code, err):
         log_once("notifier-auth", NOTIFIER_DENIED)
     else:
         code = "error" if status == "error" else exit_code(return_code)
-        log_once("notifier-fail", notifier_problem(code, err))
+        log_once("notifier-fail", notifier_problem(code, err, out))
     return "fallback"
 
 
 def notify_cb(data, command, return_code, out, err):
     global notify_hook, notify_failures, next_attempt, give_up, inflight_ids
     status = process_status(return_code)
+    if inflight_backend == "terminal-notifier":
+        notifier_chunks["out"] += out or ""
+        notifier_chunks["err"] += err or ""
     if status == "running":
         return weechat.WEECHAT_RC_OK
     notify_hook = ""
     sent_ids = set(inflight_ids)
     inflight_ids = []
     if inflight_backend == "terminal-notifier":
-        outcome = notifier_finished(status, return_code, err)
+        captured_out = notifier_chunks["out"]
+        captured_err = notifier_chunks["err"]
+        notifier_chunks["out"] = ""
+        notifier_chunks["err"] = ""
+        outcome = notifier_finished(status, return_code, captured_err, captured_out)
         if outcome == "shown":
             forget(sent_ids)
             refresh_title()
