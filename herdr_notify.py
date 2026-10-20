@@ -32,11 +32,15 @@
 #   title_badge      on | off
 #   max_body_length  body cap; 0 leaves Herdr's own cap
 #   retry_limit      attempts when Herdr is busy or rate-limited
+#   delivery         auto | herdr | terminal-notifier
+#   terminal_bundle  macOS bundle id, empty to detect, or off
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
+import sys
 import time
 
 try:
@@ -46,9 +50,9 @@ except ImportError:  # unit tests load this file outside WeeChat
 
 SCRIPT_NAME = "herdr_notify"
 SCRIPT_AUTHOR = "lnutimura"
-SCRIPT_VERSION = "0.1.0"
+SCRIPT_VERSION = "0.2.0"
 SCRIPT_LICENSE = "MIT"
-SCRIPT_DESC = "Notify through Herdr when a WeeChat buffer you cannot see gets a message"
+SCRIPT_DESC = "Notify when a WeeChat buffer you cannot see gets a message"
 
 SETTINGS = (
     ("level", "message", "message (channel text) or highlight (mentions and private messages)"),
@@ -58,6 +62,16 @@ SETTINGS = (
     ("title_badge", "on", "on or off; write the unread summary into the terminal title"),
     ("max_body_length", "240", "maximum body length; 0 leaves Herdr's own limit"),
     ("retry_limit", "30", "how many times to retry when Herdr is busy or rate-limited"),
+    (
+        "delivery",
+        "auto",
+        "auto, herdr, or terminal-notifier; auto uses terminal-notifier on macOS when it is installed",
+    ),
+    (
+        "terminal_bundle",
+        "",
+        "macOS bundle id to activate on click; empty detects the terminal; off skips activation",
+    ),
 )
 
 TITLE_LIMIT = 80
@@ -77,6 +91,28 @@ TOAST_SNIPPET = (
     "[ui.toast.herdr]\n"
     'position = "bottom-right"'
 )
+NOTIFIER_CANDIDATES = (
+    "/opt/homebrew/bin/terminal-notifier",
+    "/usr/local/bin/terminal-notifier",
+)
+NOTIFIER_MISSING = (
+    "terminal-notifier was not found. Notifications will use Herdr toasts. "
+    "Install it with: brew install terminal-notifier"
+)
+NOTIFIER_DENIED = (
+    "terminal-notifier is not allowed to post notifications. Turn it on in "
+    "System Settings, under Notifications, for terminal-notifier. Herdr toasts "
+    "will be used until this script is reloaded."
+)
+# TERM_PROGRAM, or a terminal-specific variable, to the bundle id -activate expects.
+TERMINAL_BUNDLES = {
+    "ghostty": "com.mitchellh.ghostty",
+    "iTerm.app": "com.googlecode.iterm2",
+    "Apple_Terminal": "com.apple.Terminal",
+    "WezTerm": "com.github.wez.wezterm",
+    "WarpTerminal": "dev.warp.Warp-Stable",
+}
+MACOS_SOUNDS = {"request": "Ping", "done": "Glass"}
 
 queued = []
 next_id = 1
@@ -88,6 +124,8 @@ next_attempt = 0.0
 notify_failures = 0
 focus_failures = 0
 inflight_ids = []
+inflight_backend = ""
+prefer_herdr = False
 give_up = False
 beep_suspended = False
 logged = set()
@@ -322,6 +360,164 @@ def badge_summary(events):
     return sanitize("weechat (%d)" % len(events), TITLE_LIMIT)
 
 
+def delivery_mode(value):
+    return (value or "auto").strip().lower().replace("_", "-")
+
+
+def backend_name(delivery, platform, binary, fallback):
+    """auto posts with terminal-notifier on macOS when the binary exists."""
+    mode = delivery_mode(delivery)
+    if mode == "herdr" or fallback:
+        return "herdr"
+    wants_notifier = mode == "terminal-notifier" or (mode == "auto" and platform == "darwin")
+    if wants_notifier and binary:
+        return "terminal-notifier"
+    return "herdr"
+
+
+def find_notifier(platform, which, usable):
+    if platform != "darwin":
+        return ""
+    found = which("terminal-notifier") if which else ""
+    if found:
+        return found
+    for path in NOTIFIER_CANDIDATES:
+        if usable(path):
+            return path
+    return ""
+
+
+def notifier_path():
+    def usable(path):
+        return os.path.isfile(path) and os.access(path, os.X_OK)
+
+    return find_notifier(sys.platform, shutil.which, usable)
+
+
+def detect_terminal_bundle(environ):
+    program = environ.get("TERM_PROGRAM", "")
+    if program in TERMINAL_BUNDLES:
+        return TERMINAL_BUNDLES[program]
+    if environ.get("KITTY_WINDOW_ID") or environ.get("KITTY_PID"):
+        return "net.kovidgoyal.kitty"
+    if environ.get("ALACRITTY_WINDOW_ID") or environ.get("ALACRITTY_SOCKET"):
+        return "org.alacritty"
+    return ""
+
+
+def chosen_bundle(configured, environ):
+    value = (configured or "").strip()
+    if value.lower() == "off":
+        return ""
+    if value:
+        return value
+    return detect_terminal_bundle(environ)
+
+
+def macos_sound(name):
+    return MACOS_SOUNDS.get(name, "")
+
+
+def notifier_text(text):
+    """terminal-notifier misreads a value whose first character looks like a plist."""
+    value = "" if text is None else str(text)
+    if value[:1] in "[{(\"'":
+        return "\\" + value
+    return value
+
+
+def notification_group(pane_id):
+    safe = "".join(ch if ch.isalnum() else "-" for ch in (pane_id or "pane"))
+    return "herdr-notify-" + safe.strip("-")
+
+
+def shell_quote(text):
+    return "'" + str(text).replace("'", "'\\''") + "'"
+
+
+def focus_python(pane_id):
+    """Herdr's CLI focuses a neighbor, not an arbitrary pane. pane.focus does."""
+    payload = json.dumps(
+        {
+            "id": "herdr-notify:focus",
+            "method": "pane.focus",
+            "params": {"pane_id": pane_id},
+        },
+        separators=(",", ":"),
+    )
+    return (
+        "import os,socket;"
+        "s=socket.socket(socket.AF_UNIX);"
+        "s.settimeout(5);"
+        "s.connect(os.environ['HERDR_SOCKET_PATH']);"
+        "s.sendall(%s);"
+        "s.recv(65536)"
+    ) % repr((payload + "\n").encode("utf-8"))
+
+
+def resolve_python(executable, which, usable):
+    """WeeChat's embedded Python often reports the WeeChat binary as sys.executable."""
+    if os.path.basename(executable or "").startswith("python") and usable(executable):
+        return executable
+    found = which("python3") if which else ""
+    if found:
+        return found
+    for path in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"):
+        if usable(path):
+            return path
+    return ""
+
+
+def python_bin():
+    def usable(path):
+        return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+    return resolve_python(sys.executable, shutil.which, usable)
+
+
+def focus_command(python, socket_path, pane_id):
+    if not python or not socket_path or not pane_id:
+        return ""
+    return "HERDR_SOCKET_PATH=%s %s -c %s" % (
+        shell_quote(socket_path),
+        shell_quote(python),
+        shell_quote(focus_python(pane_id)),
+    )
+
+
+def notifier_arguments(title, body, sound, group, bundle, execute):
+    shown = title or "WeeChat"
+    args = [
+        "-title=" + notifier_text(shown),
+        "-message=" + notifier_text(body or shown),
+        "-group=" + group,
+    ]
+    if sound:
+        args.append("-sound=" + sound)
+    if bundle:
+        args.append("-activate=" + bundle)
+    if execute:
+        args.append("-execute=" + execute)
+    return args
+
+
+def herdr_notify_args(title, body, sound):
+    args = ["notification", "show", title]
+    if body:
+        args.extend(("--body", body))
+    args.extend(("--sound", sound))
+    return args
+
+
+def notifier_problem(code, err):
+    detail = " ".join((err or "").split())
+    if len(detail) > 200:
+        detail = detail[:199].rstrip() + "…"
+    if detail:
+        return "terminal-notifier failed (%s): %s" % (code, detail)
+    return "terminal-notifier failed (%s)." % code
+
+
 def herdr_bin():
     binary = os.environ.get("HERDR_BIN_PATH", "").strip()
     return binary or "herdr"
@@ -498,11 +694,11 @@ def process_status(return_code):
     return "done"
 
 
-def start_process(args, callback):
+def start_process(command, args, callback):
     options = {}
     for index, arg in enumerate(args, start=1):
         options["arg%d" % index] = arg
-    return weechat.hook_process_hashtable(herdr_bin(), options, 10000, callback, "")
+    return weechat.hook_process_hashtable(command, options, 10000, callback, "")
 
 
 def fail_focus(text):
@@ -552,28 +748,67 @@ def start_focus_query():
     global focus_hook
     if focus_hook:
         return
-    hook = start_process(("api", "snapshot"), "focus_cb")
+    hook = start_process(herdr_bin(), ("api", "snapshot"), "focus_cb")
     if not hook:
         fail_focus("could not run %s." % herdr_bin())
         return
     focus_hook = hook
 
 
+def notify_invocation(title, body, sound):
+    binary = notifier_path()
+    delivery = setting("delivery")
+    backend = backend_name(delivery, sys.platform, binary, prefer_herdr)
+    if delivery_mode(delivery) == "terminal-notifier" and not binary:
+        log_once("notifier-missing", NOTIFIER_MISSING)
+    if backend != "terminal-notifier":
+        return "herdr", herdr_bin(), herdr_notify_args(title, body, sound)
+    bundle = chosen_bundle(setting("terminal_bundle"), os.environ)
+    socket_path = os.environ.get("HERDR_SOCKET_PATH", "").strip()
+    python = python_bin()
+    execute = focus_command(python, socket_path, our_pane_id())
+    if not socket_path:
+        log_once(
+            "notifier-focus",
+            "HERDR_SOCKET_PATH is unset, so clicking the notification cannot focus this pane.",
+        )
+    elif not python:
+        log_once(
+            "notifier-python",
+            "python3 was not found, so clicking the notification cannot focus this pane.",
+        )
+    return (
+        "terminal-notifier",
+        binary,
+        notifier_arguments(
+            title,
+            body,
+            macos_sound(sound),
+            notification_group(our_pane_id()),
+            bundle,
+            execute,
+        ),
+    )
+
+
 def start_notify(events):
-    global notify_hook, inflight_ids
+    global notify_hook, inflight_ids, inflight_backend, prefer_herdr, next_attempt
     title = choose_title(events) or "WeeChat"
     body = choose_body(events)
-    args = ["notification", "show", title]
-    if body:
-        args.extend(("--body", body))
-    args.extend(("--sound", choose_sound(events)))
+    backend, command, args = notify_invocation(title, body, choose_sound(events))
+    inflight_backend = backend
     inflight_ids = [event.id for event in events]
-    hook = start_process(args, "notify_cb")
-    if not hook:
-        inflight_ids = []
-        give_up_binary()
+    hook = start_process(command, args, "notify_cb")
+    if hook:
+        notify_hook = hook
         return
-    notify_hook = hook
+    inflight_ids = []
+    if backend == "terminal-notifier":
+        prefer_herdr = True
+        next_attempt = 0.0
+        log_once("notifier-missing", NOTIFIER_MISSING)
+        return
+    give_up_binary()
 
 
 def give_up_binary():
@@ -674,6 +909,36 @@ def focus_cb(data, command, return_code, out, err):
     return weechat.WEECHAT_RC_OK
 
 
+def exit_code(return_code):
+    try:
+        return int(return_code)
+    except (TypeError, ValueError):
+        return 1
+
+
+def notifier_finished(status, return_code, err):
+    """A terminal-notifier failure falls back to Herdr toasts. The events stay queued."""
+    global prefer_herdr, notify_failures, next_attempt
+    if status != "error":
+        code = exit_code(return_code)
+        if code == 0:
+            notify_failures = 0
+            return "shown"
+        if code == 4 and notify_failures < retry_limit():
+            notify_failures += 1
+            next_attempt = time.time() + RETRY_SECONDS
+            return "retry"
+    prefer_herdr = True
+    notify_failures = 0
+    next_attempt = 0.0
+    if status != "error" and exit_code(return_code) == 3:
+        log_once("notifier-auth", NOTIFIER_DENIED)
+    else:
+        code = "error" if status == "error" else exit_code(return_code)
+        log_once("notifier-fail", notifier_problem(code, err))
+    return "fallback"
+
+
 def notify_cb(data, command, return_code, out, err):
     global notify_hook, notify_failures, next_attempt, give_up, inflight_ids
     status = process_status(return_code)
@@ -682,6 +947,13 @@ def notify_cb(data, command, return_code, out, err):
     notify_hook = ""
     sent_ids = set(inflight_ids)
     inflight_ids = []
+    if inflight_backend == "terminal-notifier":
+        outcome = notifier_finished(status, return_code, err)
+        if outcome == "shown":
+            forget(sent_ids)
+            refresh_title()
+            stop_timer_if_idle()
+        return weechat.WEECHAT_RC_OK
     if status == "error":
         forget(sent_ids)
         give_up_binary()

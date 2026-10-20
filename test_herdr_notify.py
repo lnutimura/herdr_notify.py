@@ -3,6 +3,7 @@
 
 import importlib.util
 import pathlib
+import subprocess
 import unittest
 
 PATH = pathlib.Path(__file__).with_name("herdr_notify.py")
@@ -137,6 +138,106 @@ class ToastTests(unittest.TestCase):
         events = [event("message", "#chan", "ada", "hi")]
         self.assertEqual(notify.badge_summary(events), "weechat (1) #chan")
         self.assertEqual(notify.badge_summary([]), "")
+
+
+class NotifierTests(unittest.TestCase):
+    def test_auto_uses_terminal_notifier_only_on_macos(self):
+        binary = "/opt/homebrew/bin/terminal-notifier"
+        self.assertEqual(notify.backend_name("auto", "darwin", binary, False), "terminal-notifier")
+        self.assertEqual(notify.backend_name("auto", "linux", binary, False), "herdr")
+        self.assertEqual(notify.backend_name("auto", "darwin", "", False), "herdr")
+        self.assertEqual(notify.backend_name("herdr", "darwin", binary, False), "herdr")
+        self.assertEqual(notify.backend_name("terminal_notifier", "linux", binary, False), "terminal-notifier")
+        self.assertEqual(notify.backend_name("terminal-notifier", "darwin", binary, True), "herdr")
+
+    def test_finds_homebrew_notifier_when_path_misses_it(self):
+        self.assertEqual(
+            notify.find_notifier("linux", lambda _name: "/usr/bin/terminal-notifier", lambda _path: True),
+            "",
+        )
+        self.assertEqual(
+            notify.find_notifier("darwin", lambda _name: "/custom/terminal-notifier", lambda _path: False),
+            "/custom/terminal-notifier",
+        )
+        self.assertEqual(
+            notify.find_notifier(
+                "darwin",
+                lambda _name: "",
+                lambda path: path == "/opt/homebrew/bin/terminal-notifier",
+            ),
+            "/opt/homebrew/bin/terminal-notifier",
+        )
+
+    def test_terminal_bundle(self):
+        self.assertEqual(notify.chosen_bundle("", {"TERM_PROGRAM": "ghostty"}), "com.mitchellh.ghostty")
+        self.assertEqual(notify.chosen_bundle("", {"KITTY_WINDOW_ID": "1"}), "net.kovidgoyal.kitty")
+        self.assertEqual(notify.chosen_bundle("", {"ALACRITTY_SOCKET": "/tmp/alacritty.sock"}), "org.alacritty")
+        self.assertEqual(notify.chosen_bundle("off", {"TERM_PROGRAM": "ghostty"}), "")
+        self.assertEqual(notify.chosen_bundle("com.example.Term", {"TERM_PROGRAM": "ghostty"}), "com.example.Term")
+
+    def test_macos_sounds_follow_the_herdr_names(self):
+        self.assertEqual(notify.macos_sound("request"), "Ping")
+        self.assertEqual(notify.macos_sound("done"), "Glass")
+        self.assertEqual(notify.macos_sound("none"), "")
+
+    def test_plist_looking_title_is_escaped(self):
+        self.assertEqual(notify.notifier_text("[hi]"), "\\[hi]")
+        self.assertEqual(notify.notifier_text("ada"), "ada")
+
+    def test_arguments_keep_the_message_out_of_the_click_command(self):
+        click = notify.focus_command("/usr/bin/python3", "/tmp/sock", "w1:p3")
+        args = notify.notifier_arguments(
+            "[ada] in #chan",
+            "hello; rm -rf /",
+            "Ping",
+            "herdr-notify-w1-p3",
+            "com.mitchellh.ghostty",
+            click,
+        )
+        execute = next(arg for arg in args if arg.startswith("-execute="))
+        message = next(arg for arg in args if arg.startswith("-message="))
+        self.assertNotIn("rm -rf", execute)
+        self.assertIn("hello; rm -rf /", message)
+        self.assertIn("-title=\\[ada] in #chan", args)
+        self.assertIn("-activate=com.mitchellh.ghostty", args)
+        self.assertIn("-sound=Ping", args)
+        self.assertIn("-group=herdr-notify-w1-p3", args)
+
+    def test_group_id_is_safe(self):
+        self.assertEqual(notify.notification_group("w1:p3"), "herdr-notify-w1-p3")
+
+    def test_embedded_weechat_python_is_not_used_for_the_click(self):
+        usable = lambda path: path.endswith("python3")
+        self.assertEqual(
+            notify.resolve_python("/usr/bin/weechat", lambda _name: "/usr/bin/python3", usable),
+            "/usr/bin/python3",
+        )
+        self.assertEqual(
+            notify.resolve_python("/opt/homebrew/bin/python3", lambda _name: "", usable),
+            "/opt/homebrew/bin/python3",
+        )
+
+    def test_focus_command_is_a_pane_focus_request(self):
+        command = notify.focus_command("/bin/true", "/tmp/herdr's.sock", "w1:p3")
+        self.assertIn("pane.focus", command)
+        self.assertIn("w1:p3", command)
+        self.assertIn("'/tmp/herdr'\\''s.sock'", command)
+        compile(notify.focus_python("w1:p3"), "<focus>", "exec")
+        subprocess.check_call(["sh", "-c", command])
+        self.assertEqual(notify.focus_command("", "/tmp/sock", "w1:p3"), "")
+
+    def test_notifier_failure_keeps_the_events_and_falls_back(self):
+        notify.prefer_herdr = False
+        notify.notify_failures = 0
+        self.assertEqual(notify.notifier_finished("done", "0", ""), "shown")
+        self.assertFalse(notify.prefer_herdr)
+        self.assertEqual(notify.notifier_finished("done", "4", ""), "retry")
+        self.assertFalse(notify.prefer_herdr)
+        self.assertEqual(notify.notify_failures, 1)
+        self.assertEqual(notify.notifier_finished("done", "3", ""), "fallback")
+        self.assertTrue(notify.prefer_herdr)
+        notify.prefer_herdr = False
+        notify.notify_failures = 0
 
 
 if __name__ == "__main__":
