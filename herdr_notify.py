@@ -41,6 +41,7 @@ import os
 import shutil
 import sys
 import time
+from dataclasses import dataclass
 
 try:
     import weechat
@@ -152,15 +153,17 @@ title_current = None
 bound_keys = []
 
 
+@dataclass
 class Event:
-    def __init__(self, event_id, buffer, name, nick, text, kind, due):
-        self.id = event_id
-        self.buffer = buffer
-        self.name = name
-        self.nick = nick
-        self.text = text
-        self.kind = kind
-        self.due = due
+    """One queued line. `due` is a time.monotonic() deadline."""
+
+    id: int
+    buffer: str
+    name: str
+    nick: str
+    text: str
+    kind: str
+    due: float
 
 
 def setting(name):
