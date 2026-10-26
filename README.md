@@ -80,7 +80,7 @@ Set the id that command prints:
 
 ## What you get
 
-A channel message, mention, or private message waits 3 seconds. If you open that buffer in the focused Herdr pane during the wait, it stays quiet. Otherwise one notification is shown.
+A mention or private message waits 3 seconds. If you open that buffer in the focused Herdr pane during the wait, it stays quiet. Otherwise one notification is shown. With `level` set to `message`, ordinary channel messages do the same.
 
 - One mention or private message: title `nick in #chan`, the message as the body, and the `request` sound.
 - Several lines: one notification, such as `3 messages in #chan`. A mention in the batch uses the `request` sound. A batch of ordinary messages does not.
@@ -103,7 +103,7 @@ That row is optional. The toast does not depend on it.
 
 Change these in WeeChat. They live under `plugins.var.python.herdr_notify.*`.
 
-- `level` — `message` (default) or `highlight`. `highlight` keeps mentions and private messages.
+- `level` — `highlight` (default) or `message`. `highlight` keeps mentions and private messages; `message` adds every channel message.
 - `delay` — seconds to wait before notifying. Default `3`.
 - `sound_highlight` — `none`, `done`, or `request`. Default `request`.
 - `sound_message` — `none`, `done`, or `request`. Default `none`.
@@ -116,8 +116,10 @@ Change these in WeeChat. They live under `plugins.var.python.herdr_notify.*`.
 Example:
 
 ```
-/set plugins.var.python.herdr_notify.level highlight
+/set plugins.var.python.herdr_notify.level message
 ```
+
+Upgrading from 0.2: an existing `level` setting is kept, so a setup that already has `message` stays on `message`.
 
 ## Limits
 

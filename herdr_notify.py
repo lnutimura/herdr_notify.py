@@ -49,12 +49,12 @@ except ImportError:  # unit tests load this file outside WeeChat
 
 SCRIPT_NAME = "herdr_notify"
 SCRIPT_AUTHOR = "lnutimura"
-SCRIPT_VERSION = "0.2.0"
+SCRIPT_VERSION = "0.3.0"
 SCRIPT_LICENSE = "MIT"
 SCRIPT_DESC = "Notify when a WeeChat buffer you cannot see gets a message"
 
 SETTINGS = (
-    ("level", "message", "message (channel text) or highlight (mentions and private messages)"),
+    ("level", "highlight", "highlight (mentions and private messages) or message (all channel text)"),
     ("delay", "3", "seconds to wait before notifying, so a buffer you open stays quiet"),
     ("sound_highlight", "request", "sound for a mention or private message: none, done, or request"),
     ("sound_message", "none", "sound for other channel messages: none, done, or request"),
