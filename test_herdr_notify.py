@@ -4,6 +4,7 @@
 import importlib.util
 import os
 import pathlib
+import shutil
 import subprocess
 import unittest
 
@@ -255,7 +256,7 @@ class NotifierTests(unittest.TestCase):
         )
 
     def test_focus_command_is_a_pane_focus_request(self):
-        command = notify.focus_command("/bin/true", "/tmp/herdr's.sock", "w1:p3")
+        command = notify.focus_command(shutil.which("true"), "/tmp/herdr's.sock", "w1:p3")
         self.assertIn("pane.focus", command)
         self.assertIn("w1:p3", command)
         self.assertIn("'/tmp/herdr'\\''s.sock'", command)
