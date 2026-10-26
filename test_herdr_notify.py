@@ -2,6 +2,7 @@
 """Behavior tests for herdr_notify.py. Run: python3 test_herdr_notify.py"""
 
 import importlib.util
+import os
 import pathlib
 import subprocess
 import unittest
@@ -83,6 +84,17 @@ class SnapshotTests(unittest.TestCase):
         }
         self.assertEqual(notify.focused_pane_id(payload), "w1:p2")
 
+    def test_nested_pane_is_not_taken_for_the_session_focus(self):
+        payload = {
+            "result": {
+                "type": "session_snapshot",
+                "snapshot": {
+                    "workspaces": [{"panes": [{"type": "pane_info", "pane": {"pane_id": "w1:p1"}}]}],
+                },
+            }
+        }
+        self.assertIsNone(notify.focused_pane_id(payload))
+
     def test_reads_pane_current(self):
         payload = {"result": {"type": "pane_current", "pane": {"pane_id": "w9:p9"}}}
         self.assertEqual(notify.focused_pane_id(payload), "w9:p9")
@@ -138,6 +150,18 @@ class ToastTests(unittest.TestCase):
         events = [event("message", "#chan", "ada", "hi")]
         self.assertEqual(notify.badge_summary(events), "weechat (1) #chan")
         self.assertEqual(notify.badge_summary([]), "")
+
+    def test_zero_body_length_leaves_the_cap_to_the_backend(self):
+        text = "x" * 600
+        events = [event("highlight", "#chan", "ada", text)]
+        notify.weechat = FakeWeechat()
+        try:
+            notify.weechat.options["max_body_length"] = "0"
+            self.assertEqual(notify.choose_body(events), text)
+            notify.weechat.options["max_body_length"] = "500"
+            self.assertEqual(len(notify.choose_body(events)), 500)
+        finally:
+            notify.weechat = None
 
 
 class NotifierTests(unittest.TestCase):
@@ -252,6 +276,171 @@ class NotifierTests(unittest.TestCase):
         self.assertTrue(notify.prefer_herdr)
         notify.prefer_herdr = False
         notify.notify_failures = 0
+
+
+class FakeWeechat:
+    """Just enough of the weechat module to drive the callbacks."""
+
+    WEECHAT_RC_OK = 0
+    WEECHAT_HOOK_PROCESS_RUNNING = -1
+    WEECHAT_HOOK_PROCESS_ERROR = -2
+
+    def __init__(self):
+        self.options = {"delivery": "herdr"}
+        self.commands = []
+        self.printed = []
+        self.processes = []
+        self.process_starts = True
+        self.displayed = {}
+
+    def config_get_plugin(self, name):
+        return self.options.get(name, "")
+
+    def config_set_plugin(self, name, value):
+        self.options[name] = value
+
+    def prnt(self, buffer, text):
+        self.printed.append(text)
+
+    def command(self, buffer, text):
+        self.commands.append(text)
+
+    def hook_timer(self, interval, align, calls, callback, data):
+        return "timer"
+
+    def unhook(self, hook):
+        pass
+
+    def hook_process_hashtable(self, command, options, timeout, callback, data):
+        args = [options["arg%d" % index] for index in range(1, len(options) + 1)]
+        self.processes.append((command, args, timeout, callback))
+        return "process" if self.process_starts else ""
+
+    def buffer_get_integer(self, buffer, name):
+        if name == "num_displayed":
+            return self.displayed.get(buffer, 0)
+        return 3
+
+    def buffer_get_string(self, buffer, name):
+        return buffer
+
+
+class CallbackTests(unittest.TestCase):
+    """Drive the queue, focus check and notify callbacks through a fake WeeChat."""
+
+    def setUp(self):
+        self.weechat = FakeWeechat()
+        self.saved_pane = os.environ.get("HERDR_PANE_ID")
+        os.environ["HERDR_PANE_ID"] = "w1:p1"
+        notify.weechat = self.weechat
+        notify.queued = []
+        notify.next_id = 1
+        notify.timer_hook = ""
+        notify.focus_hook = ""
+        notify.notify_hook = ""
+        notify.focus_cache = {"at": 0.0, "pane_id": None}
+        notify.next_attempt = 0.0
+        notify.notify_failures = 0
+        notify.focus_failures = 0
+        notify.inflight_ids = []
+        notify.inflight_backend = ""
+        notify.prefer_herdr = False
+        notify.give_up = False
+        notify.beep_suspended = False
+        notify.logged = set()
+        notify.outer_focused = True
+        notify.title_current = None
+        notify.bound_keys = []
+
+    def tearDown(self):
+        notify.weechat = None
+        if self.saved_pane is None:
+            os.environ.pop("HERDR_PANE_ID", None)
+        else:
+            os.environ["HERDR_PANE_ID"] = self.saved_pane
+
+    def queue_due_highlight(self, buffer="#chan"):
+        notify.enqueue(buffer, "ada", "hello", "highlight")
+        notify.queued[-1].due = 0.0
+
+    def focus_on(self, pane_id):
+        notify.focus_cache["at"] = notify.time.monotonic()
+        notify.focus_cache["pane_id"] = pane_id
+
+    def test_timed_out_herdr_call_is_retried(self):
+        self.queue_due_highlight()
+        self.focus_on("w1:p2")
+        notify.consider_send()
+        command, args, timeout, callback = self.weechat.processes[-1]
+        self.assertEqual(args[:2], ["notification", "show"])
+        self.assertGreater(timeout, 10000)
+        notify.notify_cb("", command, self.weechat.WEECHAT_HOOK_PROCESS_ERROR, "", "")
+        self.assertFalse(notify.give_up)
+        self.assertEqual(len(notify.queued), 1)
+        self.assertGreater(notify.next_attempt, 0.0)
+
+    def test_shown_notification_empties_the_queue(self):
+        self.queue_due_highlight()
+        self.focus_on("w1:p2")
+        notify.consider_send()
+        shown = '{"result": {"type": "notification_show", "shown": true, "reason": "shown"}}'
+        notify.notify_cb("", "herdr", 0, shown, "")
+        self.assertEqual(notify.queued, [])
+        self.assertEqual(notify.notify_failures, 0)
+
+    def test_missing_binary_gives_up_and_restores_beep(self):
+        self.weechat.options["beep_suspended"] = "on"
+        self.weechat.process_starts = False
+        self.queue_due_highlight()
+        self.focus_on("w1:p2")
+        notify.consider_send()
+        self.assertTrue(notify.give_up)
+        self.assertIn("/mute /trigger enable beep", self.weechat.commands)
+        self.assertEqual(self.weechat.options["beep_suspended"], "off")
+
+    def test_disabled_toasts_restore_beep(self):
+        self.weechat.options["beep_suspended"] = "on"
+        self.queue_due_highlight()
+        self.focus_on("w1:p2")
+        notify.consider_send()
+        notify.notify_cb("", "herdr", 1, '{"error": {"code": "disabled"}}', "")
+        self.assertTrue(notify.give_up)
+        self.assertIn("/mute /trigger enable beep", self.weechat.commands)
+
+    def test_snapshot_split_across_callbacks_is_joined(self):
+        self.queue_due_highlight()
+        notify.consider_send()
+        command, args, _timeout, callback = self.weechat.processes[-1]
+        self.assertEqual((args, callback), (["api", "snapshot"], "focus_cb"))
+        snapshot = (
+            '{"result": {"type": "session_snapshot", "snapshot": {"focused_pane_id": "w1:p2", '
+            '"workspaces": [], "padding": "' + "x" * 70000 + '"}}}'
+        )
+        running = self.weechat.WEECHAT_HOOK_PROCESS_RUNNING
+        notify.focus_cb("", command, running, snapshot[:65536], "")
+        notify.focus_cb("", command, 0, snapshot[65536:], "")
+        self.assertEqual(notify.focus_cache["pane_id"], "w1:p2")
+        self.assertEqual(self.weechat.processes[-1][1][:2], ["notification", "show"])
+
+    def test_visible_buffer_in_focused_pane_is_not_notified(self):
+        self.weechat.displayed["#chan"] = 1
+        self.queue_due_highlight()
+        self.focus_on("w1:p1")
+        notify.consider_send()
+        self.assertEqual(notify.queued, [])
+        self.assertEqual(self.weechat.processes, [])
+
+    def test_switching_to_the_buffer_silences_it(self):
+        notify.enqueue("#chan", "ada", "hello", "highlight")
+        self.weechat.displayed["#chan"] = 1
+        self.focus_on("w1:p1")
+        notify.buffer_switch_cb("", "buffer_switch", "#chan")
+        self.assertEqual(notify.queued, [])
+        self.assertEqual(self.weechat.processes, [])
+
+    def test_shutdown_turns_focus_reporting_off(self):
+        notify.shutdown_cb()
+        self.assertTrue(any("?1004l" in command for command in self.weechat.commands))
 
 
 if __name__ == "__main__":
