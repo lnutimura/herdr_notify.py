@@ -43,6 +43,6 @@ All notable changes to this project are documented here. The format follows
 - Herdr toasts for messages in WeeChat buffers you cannot see, with a delay,
   batching, sounds, and an unread badge in the pane title.
 
-[0.3.0]: https://github.com/lnutimura/herdr_notify.py/compare/ce9f038...HEAD
+[0.3.0]: https://github.com/lnutimura/herdr_notify.py/compare/ce9f038...v0.3.0
 [0.2.0]: https://github.com/lnutimura/herdr_notify.py/compare/d25b964...ce9f038
 [0.1.0]: https://github.com/lnutimura/herdr_notify.py/commit/d25b964
