@@ -1,0 +1,11 @@
+# Tool settings only. The script is installed by linking herdr_notify.py
+# into WeeChat's python/autoload directory; see README.md.
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# The coding line and %-formatting follow WeeChat script conventions.
+ignore = ["UP009", "UP031"]

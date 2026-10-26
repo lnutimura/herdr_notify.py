@@ -175,10 +175,7 @@ class NotifierTests(unittest.TestCase):
         self.assertEqual(notify.backend_name("terminal-notifier", "darwin", binary, True), "herdr")
 
     def test_finds_homebrew_notifier_when_path_misses_it(self):
-        bundle = (
-            "/opt/homebrew/Cellar/terminal-notifier/3.1.0/"
-            "terminal-notifier.app/Contents/MacOS/terminal-notifier"
-        )
+        bundle = "/opt/homebrew/Cellar/terminal-notifier/3.1.0/terminal-notifier.app/Contents/MacOS/terminal-notifier"
         self.assertEqual(
             notify.find_notifier("linux", lambda _name: "/usr/bin/terminal-notifier", lambda _path: True),
             "",
@@ -245,7 +242,9 @@ class NotifierTests(unittest.TestCase):
         self.assertEqual(notify.notification_group("w1:p3"), "herdr-notify-w1-p3")
 
     def test_embedded_weechat_python_is_not_used_for_the_click(self):
-        usable = lambda path: path.endswith("python3")
+        def usable(path):
+            return path.endswith("python3")
+
         self.assertEqual(
             notify.resolve_python("/usr/bin/weechat", lambda _name: "/usr/bin/python3", usable),
             "/usr/bin/python3",
