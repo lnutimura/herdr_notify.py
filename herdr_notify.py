@@ -30,12 +30,10 @@
 #   sound_highlight  none | done | request
 #   sound_message    none | done | request
 #   title_badge      on | off
-#   max_body_length  body cap; 0 leaves Herdr's own cap
-#   retry_limit      attempts when Herdr is busy or rate-limited
+#   max_body_length  body cap; 0 leaves the cap to Herdr or macOS
+#   retry_limit      attempts when Herdr is busy, rate-limited or slow
 #   delivery         auto | herdr | terminal-notifier
 #   terminal_bundle  macOS bundle id, empty to detect, or off
-
-from __future__ import annotations
 
 import glob
 import json
@@ -61,8 +59,8 @@ SETTINGS = (
     ("sound_highlight", "request", "sound for a mention or private message: none, done, or request"),
     ("sound_message", "none", "sound for other channel messages: none, done, or request"),
     ("title_badge", "on", "on or off; write the unread summary into the terminal title"),
-    ("max_body_length", "240", "maximum body length; 0 leaves Herdr's own limit"),
-    ("retry_limit", "30", "how many times to retry when Herdr is busy or rate-limited"),
+    ("max_body_length", "240", "maximum body length; 0 leaves the limit to Herdr or macOS"),
+    ("retry_limit", "30", "how many times to retry when Herdr is busy, rate-limited, or slow"),
     (
         "delivery",
         "auto",
@@ -77,9 +75,17 @@ SETTINGS = (
 
 TITLE_LIMIT = 80
 BODY_LIMIT = 240
+# What one queued line keeps. The body cap applies when the notification is built.
+TEXT_LIMIT = 4096
 FOCUS_CACHE_SECONDS = 0.3
 RETRY_SECONDS = 1.0
 TIMER_MS = 500
+# Longer than terminal-notifier's own 10 s watchdog, so its exit code 4 arrives
+# before WeeChat kills the process.
+PROCESS_TIMEOUT_MS = 15000
+# Herdr answers that are worth another attempt. "timeout" covers a process
+# WeeChat had to kill; None covers output that was not a Herdr reply.
+RETRY_REASONS = ("busy", "rate_limited", "no_foreground_client", "timeout", None)
 # WeeChat buffer notify property: 0 none, 1 highlight, 2 message, 3 all.
 NOTIFY_NONE = 0
 NOTIFY_HIGHLIGHT = 1
@@ -134,7 +140,9 @@ notify_failures = 0
 focus_failures = 0
 inflight_ids = []
 inflight_backend = ""
-notifier_chunks = {"out": "", "err": ""}
+# hook_process delivers large output in several calls; these collect it.
+notify_output = {"out": "", "err": ""}
+focus_output = {"out": ""}
 prefer_herdr = False
 give_up = False
 beep_suspended = False
@@ -199,13 +207,12 @@ def retry_limit():
 
 
 def body_limit():
+    """0 means no cap here; Herdr or macOS shortens the body itself."""
     try:
         value = int(setting("max_body_length"))
     except ValueError:
         return BODY_LIMIT
-    if value <= 0:
-        return BODY_LIMIT
-    return min(value, BODY_LIMIT)
+    return max(value, 0)
 
 
 def title_badge_enabled():
@@ -275,36 +282,26 @@ def parse_json(text):
 
 
 def focused_pane_id(payload):
-    """Return the session focus. Per-tab layout focus is a different field."""
+    """Return the session focus. Per-tab layout focus is a different field.
 
-    def walk(node):
-        if isinstance(node, dict):
-            pane_id = node.get("focused_pane_id")
-            if isinstance(pane_id, str) and pane_id and (
-                "layouts" in node or "workspaces" in node
-            ):
-                return pane_id
-            pane = node.get("pane")
-            if (
-                isinstance(pane, dict)
-                and node.get("type") in ("pane_current", "pane_info")
-                and isinstance(pane.get("pane_id"), str)
-            ):
-                return pane["pane_id"]
-            for value in node.values():
-                found = walk(value)
-                if found:
-                    return found
-        elif isinstance(node, list):
-            for item in node:
-                found = walk(item)
-                if found:
-                    return found
-        return None
-
+    Only the reply's own level is read. A pane listed deeper in a snapshot is
+    not the focused one, so a snapshot without a session focus returns None.
+    """
     if not isinstance(payload, dict):
         return None
-    return walk(payload)
+    result = payload.get("result", payload)
+    if not isinstance(result, dict):
+        return None
+    if result.get("type") in ("pane_current", "pane_info"):
+        pane = result.get("pane")
+        pane_id = pane.get("pane_id") if isinstance(pane, dict) else None
+        return pane_id if isinstance(pane_id, str) and pane_id else None
+    for node in (result.get("snapshot"), result):
+        if isinstance(node, dict) and ("layouts" in node or "workspaces" in node):
+            pane_id = node.get("focused_pane_id")
+            if isinstance(pane_id, str) and pane_id:
+                return pane_id
+    return None
 
 
 def notification_reason(payload):
@@ -332,7 +329,7 @@ def choose_title(events):
     for event in events:
         if event.name and event.name not in names:
             names.append(event.name)
-    noun = "message" if len(events) == 1 else "messages"
+    noun = "messages"
     if len(names) == 1:
         title = "%d %s in %s" % (len(events), noun, names[0])
     elif names:
@@ -630,8 +627,9 @@ def unbind_focus_keys():
     bound_keys = []
 
 
-def enable_focus_reporting():
-    weechat.command("", stdout_command("\x1b[?1004h\n"))
+def set_focus_reporting(enabled):
+    """Mode 1004 makes the terminal send meta-[I and meta-[O on focus changes."""
+    weechat.command("", stdout_command("\x1b[?1004%s\n" % ("h" if enabled else "l")))
 
 
 def set_terminal_title(text):
@@ -731,7 +729,7 @@ def start_process(command, args, callback):
     options = {}
     for index, arg in enumerate(args, start=1):
         options["arg%d" % index] = arg
-    return weechat.hook_process_hashtable(command, options, 10000, callback, "")
+    return weechat.hook_process_hashtable(command, options, PROCESS_TIMEOUT_MS, callback, "")
 
 
 def fail_focus(text):
@@ -739,10 +737,10 @@ def fail_focus(text):
     global focus_failures, next_attempt
     focus_failures += 1
     if focus_failures < 3:
-        next_attempt = time.time() + RETRY_SECONDS
+        next_attempt = time.monotonic() + RETRY_SECONDS
         return
     log_once("focus", "%s Notifications will be sent without a focus check." % text)
-    focus_cache["at"] = time.time()
+    focus_cache["at"] = time.monotonic()
     focus_cache["pane_id"] = ""
     focus_failures = 0
     next_attempt = 0.0
@@ -759,7 +757,7 @@ def consider_send():
         clear_title()
         stop_timer_if_idle()
         return
-    now = time.time()
+    now = time.monotonic()
     if now < next_attempt or notify_hook or focus_hook:
         return
     if not due_events(now):
@@ -781,6 +779,7 @@ def start_focus_query():
     global focus_hook
     if focus_hook:
         return
+    focus_output["out"] = ""
     hook = start_process(herdr_bin(), ("api", "snapshot"), "focus_cb")
     if not hook:
         fail_focus("could not run %s." % herdr_bin())
@@ -830,8 +829,8 @@ def start_notify(events):
     body = choose_body(events)
     backend, command, args = notify_invocation(title, body, choose_sound(events))
     inflight_backend = backend
-    notifier_chunks["out"] = ""
-    notifier_chunks["err"] = ""
+    notify_output["out"] = ""
+    notify_output["err"] = ""
     inflight_ids = [event.id for event in events]
     hook = start_process(command, args, "notify_cb")
     if hook:
@@ -850,6 +849,7 @@ def give_up_binary():
     global give_up
     give_up = True
     queued.clear()
+    restore_beep()
     log_once("binary", "could not run %s. Is it on PATH?" % herdr_bin())
     clear_title()
     stop_timer_if_idle()
@@ -863,9 +863,9 @@ def enqueue(buffer, nick, text, kind):
             buffer,
             buffer_name(buffer),
             sanitize(nick, TITLE_LIMIT),
-            sanitize(text, BODY_LIMIT),
+            sanitize(text, TEXT_LIMIT),
             kind,
-            time.time() + delay_seconds(),
+            time.monotonic() + delay_seconds(),
         )
     )
     next_id += 1
@@ -878,7 +878,7 @@ def command_cb(data, buffer, args):
     arg = (args or "").strip()
     if arg == "focus":
         outer_focused = True
-        now = time.time()
+        now = time.monotonic()
         for event in queued:
             if event.buffer == buffer:
                 event.due = now
@@ -899,7 +899,7 @@ def message_cb(data, buffer, date, tags, displayed, highlight, prefix, message):
 
 
 def buffer_switch_cb(data, signal, buffer):
-    now = time.time()
+    now = time.monotonic()
     matched = False
     for event in queued:
         if event.buffer == buffer:
@@ -924,13 +924,16 @@ def timer_cb(data, remaining):
 def focus_cb(data, command, return_code, out, err):
     global focus_hook, focus_failures, next_attempt
     status = process_status(return_code)
+    focus_output["out"] += out or ""
     if status == "running":
         return weechat.WEECHAT_RC_OK
     focus_hook = ""
+    captured = focus_output["out"]
+    focus_output["out"] = ""
     if status == "error":
         fail_focus("could not run %s." % herdr_bin())
     else:
-        payload = parse_json(out or "")
+        payload = parse_json(captured)
         pane_id = focused_pane_id(payload) if payload else None
         if pane_id is None:
             reason = notification_reason(payload) if payload else None
@@ -938,7 +941,7 @@ def focus_cb(data, command, return_code, out, err):
         else:
             focus_failures = 0
             next_attempt = 0.0
-            focus_cache["at"] = time.time()
+            focus_cache["at"] = time.monotonic()
             focus_cache["pane_id"] = pane_id
     consider_send()
     return weechat.WEECHAT_RC_OK
@@ -961,7 +964,7 @@ def notifier_finished(status, return_code, err, out=""):
             return "shown"
         if code == 4 and notify_failures < retry_limit():
             notify_failures += 1
-            next_attempt = time.time() + RETRY_SECONDS
+            next_attempt = time.monotonic() + RETRY_SECONDS
             return "retry"
     prefer_herdr = True
     notify_failures = 0
@@ -977,31 +980,31 @@ def notifier_finished(status, return_code, err, out=""):
 def notify_cb(data, command, return_code, out, err):
     global notify_hook, notify_failures, next_attempt, give_up, inflight_ids
     status = process_status(return_code)
-    if inflight_backend == "terminal-notifier":
-        notifier_chunks["out"] += out or ""
-        notifier_chunks["err"] += err or ""
+    notify_output["out"] += out or ""
+    notify_output["err"] += err or ""
     if status == "running":
         return weechat.WEECHAT_RC_OK
     notify_hook = ""
     sent_ids = set(inflight_ids)
     inflight_ids = []
+    captured_out = notify_output["out"]
+    captured_err = notify_output["err"]
+    notify_output["out"] = ""
+    notify_output["err"] = ""
     if inflight_backend == "terminal-notifier":
-        captured_out = notifier_chunks["out"]
-        captured_err = notifier_chunks["err"]
-        notifier_chunks["out"] = ""
-        notifier_chunks["err"] = ""
         outcome = notifier_finished(status, return_code, captured_err, captured_out)
         if outcome == "shown":
             forget(sent_ids)
             refresh_title()
             stop_timer_if_idle()
         return weechat.WEECHAT_RC_OK
-    if status == "error":
-        forget(sent_ids)
-        give_up_binary()
-        return weechat.WEECHAT_RC_OK
 
-    reason = notification_reason(parse_json(out or "") or {})
+    # WeeChat reports a killed (timed-out) process as an error. Herdr may only
+    # be slow, so that is retried like "busy" instead of ending the script.
+    if status == "error":
+        reason = "timeout"
+    else:
+        reason = notification_reason(parse_json(captured_out) or {})
     if reason == "shown":
         notify_failures = 0
         forget(sent_ids)
@@ -1011,19 +1014,20 @@ def notify_cb(data, command, return_code, out, err):
     if reason == "disabled":
         give_up = True
         forget(sent_ids)
+        restore_beep()
         log_once("disabled", TOAST_SNIPPET)
         refresh_title()
         stop_timer_if_idle()
         return weechat.WEECHAT_RC_OK
 
     notify_failures += 1
-    next_attempt = time.time() + RETRY_SECONDS
-    if reason in ("busy", "rate_limited", "no_foreground_client", None) and notify_failures <= retry_limit():
+    next_attempt = time.monotonic() + RETRY_SECONDS
+    if reason in RETRY_REASONS and notify_failures <= retry_limit():
         stop_timer_if_idle()
         return weechat.WEECHAT_RC_OK
     forget(sent_ids)
     notify_failures = 0
-    if reason in ("busy", "rate_limited", "no_foreground_client", None):
+    if reason in RETRY_REASONS:
         log_once("retry", "Herdr did not show a notification (%s)." % (reason or "unknown"))
     else:
         log_once("notify", "Herdr rejected a notification (%s)." % reason)
@@ -1034,6 +1038,8 @@ def notify_cb(data, command, return_code, out, err):
 
 def shutdown_cb():
     restore_beep()
+    if our_pane_id():
+        set_focus_reporting(False)
     unbind_focus_keys()
     clear_title()
     return weechat.WEECHAT_RC_OK
@@ -1055,7 +1061,7 @@ def register():
         return
     init_settings()
     suspend_beep()
-    enable_focus_reporting()
+    set_focus_reporting(True)
     weechat.hook_command(
         SCRIPT_NAME,
         "Track whether the terminal window is focused.",

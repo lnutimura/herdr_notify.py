@@ -108,8 +108,8 @@ Change these in WeeChat. They live under `plugins.var.python.herdr_notify.*`.
 - `sound_highlight` — `none`, `done`, or `request`. Default `request`.
 - `sound_message` — `none`, `done`, or `request`. Default `none`.
 - `title_badge` — `on` or `off`. Default `on`.
-- `max_body_length` — cap for the notification body. Default `240`.
-- `retry_limit` — retries when Herdr answers `busy` or `rate_limited`, and when `terminal-notifier` cannot reach Notification Center. Default `30`.
+- `max_body_length` — cap for the notification body. Default `240`. `0` leaves the cap to Herdr or macOS.
+- `retry_limit` — retries when Herdr answers `busy` or `rate_limited` or does not answer within 15 seconds, and when `terminal-notifier` cannot reach Notification Center. Default `30`.
 - `delivery` — `auto` (default), `herdr`, or `terminal-notifier`. `auto` uses `terminal-notifier` on macOS when it is installed.
 - `terminal_bundle` — bundle id to activate on click. Empty detects the terminal. `off` does not activate an app.
 
@@ -124,8 +124,8 @@ Example:
 - A Herdr toast is not attached to the WeeChat pane, so clicking it or pressing `prefix+o` does not focus that tab. A `terminal-notifier` banner does focus it, through `pane.focus`.
 - If `terminal-notifier` is installed but notifications are turned off for it, the script says so once and uses Herdr toasts until it is reloaded.
 - Click-to-focus needs `HERDR_SOCKET_PATH`, which Herdr sets in the pane. The click runs a short Python program with that socket path baked in, because the click does not inherit the pane's environment.
-- If `meta-[I` or `meta-[O` is already bound, the script leaves that key alone. Those keys are how it learns that the terminal window was blurred. Tab changes are read from Herdr either way.
-- While the script is running inside Herdr it turns WeeChat's `beep` trigger off, and turns it back on when the script unloads. A hard kill can leave `beep` off; the next start restores it. `/trigger enable beep` restores it by hand.
+- If `meta-[I` or `meta-[O` is already bound, the script leaves that key alone. Those keys are how it learns that the terminal window was blurred. Tab changes are read from Herdr either way. Focus reporting is turned off again when the script unloads.
+- While the script is running inside Herdr it turns WeeChat's `beep` trigger off, and turns it back on when the script unloads or stops notifying (Herdr missing, or toasts disabled). A hard kill can leave `beep` off; the next start restores it. `/trigger enable beep` restores it by hand.
 - When the script is posting through Herdr and toasts are disabled, WeeChat prints the config snippet once on the core buffer and stays quiet until the script is reloaded.
 
 ## Tests
