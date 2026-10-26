@@ -1,140 +1,143 @@
 # herdr_notify
 
-A WeeChat script that notifies you when a message arrives in a buffer you cannot see. That includes a channel left open inside WeeChat while you are on another Herdr tab.
+[![CI](https://github.com/lnutimura/herdr_notify.py/actions/workflows/ci.yml/badge.svg)](https://github.com/lnutimura/herdr_notify.py/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-WeeChat's own hotlist does not record that case, and Herdr does not notify for ordinary terminal output. After a short delay, and only if the buffer is still hidden, the script posts the notification. On macOS it uses `terminal-notifier` when that is installed, so the banner is a real Notification Center notification and a click focuses the WeeChat pane. Otherwise it calls `herdr notification show`.
+A WeeChat script that notifies you about messages you cannot see, including a channel left open in WeeChat while you work in another Herdr tab.
+
+<!-- TODO: screenshot of a banner, e.g. docs/banner.png -->
+
+WeeChat's hotlist does not count a buffer that is on screen in a tab you are not looking at, and Herdr does not notify for ordinary terminal output. This script fills that gap. After a short delay, and only if the buffer is still out of sight, it posts one notification:
+
+- **macOS:** a Notification Center banner through [`terminal-notifier`](https://github.com/julienXX/terminal-notifier). Clicking it focuses the WeeChat pane and brings your terminal to the front.
+- **Linux, or macOS without `terminal-notifier`:** a Herdr toast (`herdr notification show`).
+
+## Quick start
+
+1. On macOS, install the notifier (skip this on Linux):
+
+   ```bash
+   brew install terminal-notifier
+   ```
+
+2. Turn on Herdr toasts in `~/.config/herdr/config.toml`, then run `herdr server reload-config`:
+
+   ```toml
+   [ui.toast]
+   delivery = "herdr"
+   delay_seconds = 1
+
+   [ui.toast.herdr]
+   position = "bottom-right"
+   ```
+
+3. Link the script into WeeChat's autoload directory and start WeeChat from a Herdr pane:
+
+   ```bash
+   mkdir -p ~/.local/share/weechat/python/autoload
+   ln -sf "$PWD/herdr_notify.py" ~/.local/share/weechat/python/autoload/herdr_notify.py
+   ```
+
+On macOS, the first banner asks for permission. Allow **terminal-notifier**.
 
 ## Requirements
 
-- WeeChat with the Python support it uses to load scripts
-- Herdr 0.7.4 or newer (`notification.show`, and focus events forwarded into the focused pane). A click focuses the pane with the `pane.focus` socket request.
-- `herdr` on `PATH`, or `HERDR_BIN_PATH` set to the Herdr binary. Herdr sets that variable inside a pane.
-- On macOS, [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) for a Notification Center banner. Without it, the script uses a Herdr toast.
-
-## Install
-
-1. On macOS, install the notifier:
-
-```bash
-brew install terminal-notifier
-```
-
-The script runs the binary inside `terminal-notifier.app` (Homebrew's Cellar, or an app in `/Applications` or `~/Applications`). A copy that only lives on `PATH` is a different program to Notification Center. Skip this step on Linux.
-
-2. Allow Herdr toasts. Linux always uses them. macOS uses them when `terminal-notifier` is missing or Notification Center has blocked it. In the Herdr config (`~/.config/herdr/config.toml`):
-
-```toml
-[ui.toast]
-delivery = "herdr"
-delay_seconds = 1
-
-[ui.toast.herdr]
-position = "bottom-right"
-```
-
-`delivery = "herdr"` draws the toast inside the Herdr window, which is the one you can see from another tab. On Linux, `delivery = "system"` asks the desktop notifier instead, for an alert that is still visible after you leave the terminal. Reload with `herdr server reload-config`.
-
-On macOS, WeeChat notifications go to Notification Center while `terminal-notifier` is available, and Herdr's own agent toasts keep using the setting above. To force WeeChat through the in-app toast:
-
-```
-/set plugins.var.python.herdr_notify.delivery herdr
-```
-
-3. Link the script into WeeChat's Python autoload directory.
-
-Scripts live in the data directory. With the default XDG layout that is `~/.local/share/weechat/python/` (`$XDG_DATA_HOME/weechat/python` when that variable is set). `~/.config/weechat` holds the `*.conf` files only.
-
-```bash
-# from a clone of this repository
-mkdir -p ~/.local/share/weechat/python/autoload
-ln -sf "$PWD/herdr_notify.py" ~/.local/share/weechat/python/autoload/herdr_notify.py
-```
-
-If WeeChat was started with `-d` / `--dir` or `WEECHAT_HOME`, or it is still using an old home because `~/.weechat/weechat.conf` exists and `~/.config/weechat/weechat.conf` does not, put the link in that home's `python/autoload` directory instead. `/debug dirs` prints the data directory this WeeChat is using.
-
-4. Start WeeChat from a Herdr pane so autoload picks the script up. Outside Herdr it loads and does nothing, and the beep trigger stays on.
-
-If WeeChat is already running, load the new symlink:
-
-```
-/python load autoload/herdr_notify.py
-```
-
-After the file changes, `/script reload herdr_notify`.
-
-5. On macOS, the first banner is the permission prompt. Allow **terminal-notifier**. If no banner appears, open System Settings → Notifications → terminal-notifier, turn notifications on, and run `/script reload herdr_notify`. A denial is remembered until that reload.
-
-Clicking a banner focuses the WeeChat pane. Ghostty, kitty, iTerm, Terminal, WezTerm, Alacritty, and Warp are also brought to the front. For another terminal, print its bundle id (the name is the name of the app):
-
-```bash
-osascript -e 'id of app "Ghostty"'
-```
-
-Set the id that command prints:
-
-```
-/set plugins.var.python.herdr_notify.terminal_bundle com.mitchellh.ghostty
-```
-
-`/set plugins.var.python.herdr_notify.terminal_bundle off` skips raising the app. The click still focuses the pane.
+- WeeChat with Python support
+- Herdr 0.7.4 or newer, with `herdr` on `PATH` or `HERDR_BIN_PATH` set (Herdr sets it inside a pane)
+- Optional, macOS only: `terminal-notifier` 3.x for Notification Center banners
 
 ## What you get
 
-A mention or private message waits 3 seconds. If you open that buffer in the focused Herdr pane during the wait, it stays quiet. Otherwise one notification is shown. With `level` set to `message`, ordinary channel messages do the same.
+- **One mention or private message:** title `nick in #chan`, the message as the body, and the `request` sound.
+- **A burst:** one notification, such as `3 messages in #chan`. The body shows the latest mention if there is one, and a mention in the batch plays the `request` sound.
+- **Quiet when you are looking:** if you switch to the buffer in the focused Herdr pane during the 3-second delay, nothing is shown.
+- **Quiet for noise:** joins, parts, quits and your own messages never notify. `/buffer notify highlight` and `/buffer notify none` still apply, per buffer.
+- **An unread badge:** while something is unread, the pane title reads `weechat (4) #chan`. Add `"terminal_title"` to a Herdr sidebar row (for example `["state_text", "terminal_title"]`) to see it there.
 
-- One mention or private message: title `nick in #chan`, the message as the body, and the `request` sound.
-- Several lines: one notification, such as `3 messages in #chan`. A mention in the batch uses the `request` sound. A batch of ordinary messages does not.
-- Joins, parts, quits, and your own messages stay quiet.
-- `/buffer notify highlight` and `/buffer notify none` still apply, per buffer.
-
-With `terminal-notifier`, a newer notification for this pane replaces the previous one. `request` plays the macOS sound Ping, `done` plays Glass, and `none` stays silent. A click sends `pane.focus` for this pane.
-
-Herdr's own toast path shows one in-app toast at a time and accepts about one notification per second. A burst is folded into that single toast. `prefix+o` does not jump to the WeeChat pane; the title names the buffer.
-
-The script also sets the pane title to `weechat (4) #chan` while something is unread, and back to `weechat` when the queue is empty. To see that title in the sidebar, add the `terminal_title` token to a row you already have:
-
-```toml
-["state_text", "terminal_title"]
-```
-
-That row is optional. The toast does not depend on it.
-
-## Settings
-
-Change these in WeeChat. They live under `plugins.var.python.herdr_notify.*`.
-
-- `level` — `highlight` (default) or `message`. `highlight` keeps mentions and private messages; `message` adds every channel message.
-- `delay` — seconds to wait before notifying. Default `3`.
-- `sound_highlight` — `none`, `done`, or `request`. Default `request`.
-- `sound_message` — `none`, `done`, or `request`. Default `none`.
-- `title_badge` — `on` or `off`. Default `on`.
-- `max_body_length` — cap for the notification body. Default `240`. `0` leaves the cap to Herdr or macOS.
-- `retry_limit` — retries when Herdr answers `busy` or `rate_limited` or does not answer within 15 seconds, and when `terminal-notifier` cannot reach Notification Center. Default `30`.
-- `delivery` — `auto` (default), `herdr`, or `terminal-notifier`. `auto` uses `terminal-notifier` on macOS when it is installed.
-- `terminal_bundle` — bundle id to activate on click. Empty detects the terminal. `off` does not activate an app.
-
-Example:
+By default only mentions and private messages notify. To be told about every channel message:
 
 ```
 /set plugins.var.python.herdr_notify.level message
 ```
 
-Upgrading from 0.2: an existing `level` setting is kept, so a setup that already has `message` stays on `message`.
+## How it works
+
+1. WeeChat prints a line. The script keeps it if its tags and the buffer's notify level allow it, and queues it with a deadline `delay` seconds away.
+2. When the deadline passes, the script asks Herdr which pane is focused (`herdr api snapshot`). It also tracks whether the terminal window itself has focus, through focus reporting (mode 1004).
+3. Lines from a buffer that is on screen, in the focused pane, in a focused window, are dropped. The rest are batched into one notification.
+4. The notification goes to `terminal-notifier` or `herdr notification show`. Busy, rate-limited or slow replies are retried. If `terminal-notifier` fails, the script falls back to Herdr toasts.
+
+Switching to a buffer or focusing the window makes its pending lines due at once, so they are checked and dropped right away rather than at the deadline.
+
+## Configuration
+
+Settings live under `plugins.var.python.herdr_notify.*` and are changed with `/set`.
+
+| Setting | Default | Values |
+| --- | --- | --- |
+| `level` | `highlight` | `highlight` (mentions and private messages) or `message` (every channel message too) |
+| `delay` | `3` | Seconds to wait before notifying |
+| `sound_highlight` | `request` | `none`, `done` or `request` |
+| `sound_message` | `none` | `none`, `done` or `request` |
+| `title_badge` | `on` | `on` or `off` |
+| `max_body_length` | `240` | Body cap; `0` leaves it to Herdr or macOS |
+| `retry_limit` | `30` | Retries when Herdr is busy, rate-limited or does not answer within 15 seconds, and when `terminal-notifier` cannot reach Notification Center |
+| `delivery` | `auto` | `auto` (`terminal-notifier` on macOS when installed), `herdr` or `terminal-notifier` |
+| `terminal_bundle` | empty | macOS bundle id to bring to the front on click; empty detects it; `off` skips it |
+
+On macOS, `request` plays the sound Ping and `done` plays Glass. Upgrading from 0.2 keeps your saved `level`.
+
+### Herdr toasts
+
+`delivery = "herdr"` draws the toast inside the Herdr window, which you can see from any tab. On Linux, `delivery = "system"` uses the desktop notifier instead, so the alert stays visible after you leave the terminal. Herdr shows one toast at a time and accepts about one per second, so a burst is folded into a single toast.
+
+On macOS, Herdr's own agent toasts keep using that setting while WeeChat uses Notification Center. To send WeeChat through Herdr toasts too:
+
+```
+/set plugins.var.python.herdr_notify.delivery herdr
+```
+
+### terminal-notifier on macOS
+
+The script runs the binary inside `terminal-notifier.app` (Homebrew's Cellar, `/Applications` or `~/Applications`). A copy that only lives on `PATH` is a different app to Notification Center.
+
+If no banner appears, open System Settings → Notifications → terminal-notifier, turn notifications on, and run `/script reload herdr_notify`. A denial is remembered until that reload.
+
+Clicking a banner focuses the WeeChat pane through Herdr's `pane.focus` request. Ghostty, kitty, iTerm, Terminal, WezTerm, Alacritty and Warp are detected and brought to the front. For another terminal, look up its bundle id and set it:
+
+```bash
+osascript -e 'id of app "Ghostty"'
+```
+
+```
+/set plugins.var.python.herdr_notify.terminal_bundle com.mitchellh.ghostty
+```
+
+A newer banner for the same pane replaces the previous one.
+
+### Other WeeChat homes
+
+Scripts live in WeeChat's data directory: `~/.local/share/weechat/python/` with the default XDG layout, or `$XDG_DATA_HOME/weechat/python`. If WeeChat runs with `-d`/`--dir` or `WEECHAT_HOME`, or still uses an old `~/.weechat` home, link the script into that home's `python/autoload` instead. `/debug dirs` prints the directory in use.
+
+To load the script into a running WeeChat, use `/python load autoload/herdr_notify.py`. After the file changes, use `/script reload herdr_notify`.
 
 ## Limits
 
-- A Herdr toast is not attached to the WeeChat pane, so clicking it or pressing `prefix+o` does not focus that tab. A `terminal-notifier` banner does focus it, through `pane.focus`.
-- If `terminal-notifier` is installed but notifications are turned off for it, the script says so once and uses Herdr toasts until it is reloaded.
-- Click-to-focus needs `HERDR_SOCKET_PATH`, which Herdr sets in the pane. The click runs a short Python program with that socket path baked in, because the click does not inherit the pane's environment.
-- If `meta-[I` or `meta-[O` is already bound, the script leaves that key alone. Those keys are how it learns that the terminal window was blurred. Tab changes are read from Herdr either way. Focus reporting is turned off again when the script unloads.
-- While the script is running inside Herdr it turns WeeChat's `beep` trigger off, and turns it back on when the script unloads or stops notifying (Herdr missing, or toasts disabled). A hard kill can leave `beep` off; the next start restores it. `/trigger enable beep` restores it by hand.
-- When the script is posting through Herdr and toasts are disabled, WeeChat prints the config snippet once on the core buffer and stays quiet until the script is reloaded.
+- Outside Herdr the script loads and does nothing.
+- A Herdr toast is not tied to the WeeChat pane, so clicking it or pressing `prefix+o` does not jump there. A `terminal-notifier` banner does.
+- Click-to-focus needs `HERDR_SOCKET_PATH`, which Herdr sets in the pane. The click runs a short Python program with that path baked in, because the click does not inherit the pane's environment.
+- The window-focus check uses the keys `meta-[I` and `meta-[O`. If you already bound them, the script leaves them alone and only tracks Herdr tabs. Focus reporting is turned off when the script unloads.
+- Inside Herdr the script turns WeeChat's `beep` trigger off, and back on when it unloads or stops notifying (Herdr missing, or toasts disabled). A hard kill can leave `beep` off; the next start restores it, or run `/trigger enable beep`.
+- If `terminal-notifier` is blocked, or Herdr toasts are disabled, the script says so once on the core buffer.
 
-## Tests
+## Development
 
 ```bash
 python3 test_herdr_notify.py
+uvx ruff check . && uvx ruff format --check .
 ```
+
+The tests need no WeeChat or Herdr. Pure helpers are tested directly, and the callbacks run against a small stand-in for the `weechat` module. See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## License
 
