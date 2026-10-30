@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# herdr_notify.py — tell Herdr when a WeeChat buffer you cannot see gets a message
+# herdr_notify.py — tell Herdr when a WeeChat buffer you cannot see has unread messages
 #
 # Copyright (c) 2026 lnutimura
 #
@@ -51,9 +51,9 @@ except ImportError:  # unit tests load this file outside WeeChat
 
 SCRIPT_NAME = "herdr_notify"
 SCRIPT_AUTHOR = "lnutimura"
-SCRIPT_VERSION = "0.3.0"
+SCRIPT_VERSION = "0.4.0"
 SCRIPT_LICENSE = "MIT"
-SCRIPT_DESC = "Notify when a WeeChat buffer you cannot see gets a message"
+SCRIPT_DESC = "Tell Herdr when a WeeChat buffer you cannot see has unread messages"
 
 SETTINGS = (
     ("level", "highlight", "highlight (mentions and private messages) or message (all channel text)"),

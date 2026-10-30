@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-10-30
+
+### Changed
+
+- **Breaking:** WeeChat now reports itself to Herdr as an agent, `blocked`
+  while something is unread and `idle` once you have looked at it. Herdr
+  marks the pane, tab and workspace, lists WeeChat in the Goto picker, and
+  shows its own "weechat needs attention" toast. With Herdr delivery this
+  replaces `herdr notification show`, so the toast no longer carries the
+  message text.
+- **Breaking:** the unread badge is now the Herdr sidebar tokens
+  `$weechat_unread` and `$summary` instead of the terminal title. Add one of
+  them to `ui.sidebar.agents.rows` to see it.
+- `sound_*` and `max_body_length` now apply to macOS banners only.
+
+### Added
+
+- Clicking a macOS banner also switches WeeChat to the buffer, through
+  WeeChat's fifo plugin.
+- When the script unloads, it clears its sidebar tokens and releases the
+  agent.
+
 ## [0.3.0] - 2026-10-26
 
 ### Changed
@@ -43,6 +65,7 @@ All notable changes to this project are documented here. The format follows
 - Herdr toasts for messages in WeeChat buffers you cannot see, with a delay,
   batching, sounds, and an unread badge in the pane title.
 
+[0.4.0]: https://github.com/lnutimura/herdr_notify.py/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/lnutimura/herdr_notify.py/compare/ce9f038...v0.3.0
 [0.2.0]: https://github.com/lnutimura/herdr_notify.py/compare/d25b964...ce9f038
 [0.1.0]: https://github.com/lnutimura/herdr_notify.py/commit/d25b964
