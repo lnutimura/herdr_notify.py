@@ -27,11 +27,11 @@
 # Settings (plugins.var.python.herdr_notify.*):
 #   level            message | highlight
 #   delay            seconds to wait before notifying
-#   sound_highlight  none | done | request
-#   sound_message    none | done | request
+#   sound_highlight  none | done | request (macOS banners)
+#   sound_message    none | done | request (macOS banners)
 #   title_badge      on | off
-#   max_body_length  body cap; 0 leaves the cap to Herdr or macOS
-#   retry_limit      attempts when Herdr is busy, rate-limited or slow
+#   max_body_length  banner body cap; 0 leaves the cap to macOS
+#   retry_limit      attempts for a banner or a Herdr report
 #   delivery         auto | herdr | terminal-notifier
 #   terminal_bundle  macOS bundle id, empty to detect, or off
 
@@ -39,6 +39,7 @@ import glob
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -57,11 +58,11 @@ SCRIPT_DESC = "Notify when a WeeChat buffer you cannot see gets a message"
 SETTINGS = (
     ("level", "highlight", "highlight (mentions and private messages) or message (all channel text)"),
     ("delay", "3", "seconds to wait before notifying, so a buffer you open stays quiet"),
-    ("sound_highlight", "request", "sound for a mention or private message: none, done, or request"),
-    ("sound_message", "none", "sound for other channel messages: none, done, or request"),
+    ("sound_highlight", "request", "macOS banner sound for a mention or private message: none, done, or request"),
+    ("sound_message", "none", "macOS banner sound for other channel messages: none, done, or request"),
     ("title_badge", "on", "on or off; write the unread summary into the terminal title"),
-    ("max_body_length", "240", "maximum body length; 0 leaves the limit to Herdr or macOS"),
-    ("retry_limit", "30", "how many times to retry when Herdr is busy, rate-limited, or slow"),
+    ("max_body_length", "240", "maximum macOS banner body length; 0 leaves the limit to macOS"),
+    ("retry_limit", "30", "how many times to retry a macOS banner or a report to Herdr"),
     (
         "delivery",
         "auto",
@@ -84,21 +85,12 @@ TIMER_MS = 500
 # Longer than terminal-notifier's own 10 s watchdog, so its exit code 4 arrives
 # before WeeChat kills the process.
 PROCESS_TIMEOUT_MS = 15000
-# Herdr answers that are worth another attempt. "timeout" covers a process
-# WeeChat had to kill; None covers output that was not a Herdr reply.
-RETRY_REASONS = ("busy", "rate_limited", "no_foreground_client", "timeout", None)
 # WeeChat buffer notify property: 0 none, 1 highlight, 2 message, 3 all.
 NOTIFY_NONE = 0
 NOTIFY_HIGHLIGHT = 1
-TOAST_SNIPPET = (
-    "Herdr toasts are off, so notifications cannot be shown. Add this to the "
-    "Herdr config and reload it:\n"
-    "[ui.toast]\n"
-    'delivery = "herdr"\n'
-    "\n"
-    "[ui.toast.herdr]\n"
-    'position = "bottom-right"'
-)
+# How this script appears to Herdr. Herdr reserves the "herdr:" prefix.
+AGENT_SOURCE = "custom:weechat"
+AGENT_LABEL = "weechat"
 NOTIFIER_CANDIDATES = (
     "/opt/homebrew/bin/terminal-notifier",
     "/usr/local/bin/terminal-notifier",
@@ -112,13 +104,13 @@ NOTIFIER_APP_GLOBS = (
     "/Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier",
 )
 NOTIFIER_MISSING = (
-    "terminal-notifier was not found. Notifications will use Herdr toasts. "
+    "terminal-notifier was not found. Herdr's own alerts will be used. "
     "Install it with: brew install terminal-notifier"
 )
 NOTIFIER_DENIED = (
     "terminal-notifier is not allowed to post notifications. Turn it on in "
-    "System Settings, under Notifications, for terminal-notifier. Herdr toasts "
-    "will be used until this script is reloaded."
+    "System Settings, under Notifications, for terminal-notifier. Herdr's own "
+    "alerts will be used until this script is reloaded."
 )
 # TERM_PROGRAM, or a terminal-specific variable, to the bundle id -activate expects.
 TERMINAL_BUNDLES = {
@@ -140,7 +132,13 @@ next_attempt = 0.0
 notify_failures = 0
 focus_failures = 0
 inflight_ids = []
-inflight_backend = ""
+# Lines you were alerted about and have not looked at yet. While this is not
+# empty, Herdr shows WeeChat as blocked.
+unread = []
+# One Herdr report per kind ("agent"): what it should say, what Herdr last
+# accepted, and the process sending it. Only the latest wanted value is sent.
+reports = {}
+last_seq = 0
 # hook_process delivers large output in several calls; these collect it.
 notify_output = {"out": "", "err": ""}
 focus_output = {"out": ""}
@@ -534,12 +532,35 @@ def notifier_arguments(title, body, sound, group, bundle, execute):
     return args
 
 
-def herdr_notify_args(title, body, sound):
-    args = ["notification", "show", title]
-    if body:
-        args.extend(("--body", body))
-    args.extend(("--sound", sound))
-    return args
+def unread_summary(events):
+    """One line for Herdr: the latest mention if there is one, else the latest line."""
+    if not events:
+        return ""
+    highlights = [event for event in events if event.kind == "highlight"]
+    latest = highlights[-1] if highlights else events[-1]
+    where = latest.name or "WeeChat"
+    if latest.nick:
+        line = "%s in %s: %s" % (latest.nick, where, latest.text)
+    else:
+        line = "%s: %s" % (where, latest.text)
+    if len(events) > 1:
+        line = "(%d) %s" % (len(events), line)
+    return sanitize(line, TITLE_LIMIT)
+
+
+def agent_report_args(pane_id, events):
+    """blocked makes Herdr mark the pane, toast and play its request sound."""
+    args = ["pane", "report-agent", pane_id, "--source", AGENT_SOURCE, "--agent", AGENT_LABEL]
+    if events:
+        return tuple(args + ["--state", "blocked", "--message", unread_summary(events)])
+    return tuple(args + ["--state", "idle"])
+
+
+def next_seq():
+    """Herdr ignores a report whose seq is not above the last one it accepted."""
+    global last_seq
+    last_seq = max(last_seq + 1, time.time_ns())
+    return last_seq
 
 
 def notifier_problem(code, err, out=""):
@@ -663,7 +684,7 @@ def ensure_timer():
 
 def stop_timer_if_idle():
     global timer_hook
-    if queued or focus_hook or notify_hook:
+    if queued or focus_hook or notify_hook or reports_pending():
         return
     if timer_hook:
         weechat.unhook(timer_hook)
@@ -687,6 +708,7 @@ def drop_buffer(buffer):
     queued = [event for event in queued if event.buffer != buffer]
     if len(queued) != before:
         refresh_title()
+    mark_seen({buffer})
     stop_timer_if_idle()
 
 
@@ -708,6 +730,8 @@ def drop_visible(now, pane_id):
             outer_focused,
         )
     ]
+    if pane_focused and outer_focused:
+        mark_seen({event.buffer for event in unread if buffer_on_screen(event.buffer)})
 
 
 def cache_is_fresh(now):
@@ -728,11 +752,11 @@ def process_status(return_code):
     return "done"
 
 
-def start_process(command, args, callback):
+def start_process(command, args, callback, data=""):
     options = {}
     for index, arg in enumerate(args, start=1):
         options["arg%d" % index] = arg
-    return weechat.hook_process_hashtable(command, options, PROCESS_TIMEOUT_MS, callback, "")
+    return weechat.hook_process_hashtable(command, options, PROCESS_TIMEOUT_MS, callback, data)
 
 
 def fail_focus(text):
@@ -752,6 +776,103 @@ def fail_focus(text):
 def forget(sent_ids):
     global queued
     queued = [event for event in queued if event.id not in sent_ids]
+
+
+def deliver(events):
+    """The user has been alerted about these lines; they stay unread until seen."""
+    forget({event.id for event in events})
+    unread.extend(events)
+    refresh_title()
+    sync_agent()
+
+
+def mark_seen(buffers):
+    global unread
+    if not buffers:
+        return
+    before = len(unread)
+    unread = [event for event in unread if event.buffer not in buffers]
+    if len(unread) != before:
+        sync_agent()
+
+
+def sync_agent():
+    pane_id = our_pane_id()
+    if pane_id:
+        want_report("agent", agent_report_args(pane_id, unread))
+
+
+def want_report(kind, args):
+    report = reports.setdefault(
+        kind,
+        {"want": None, "sent": None, "inflight": None, "hook": "", "failures": 0, "retry_at": 0.0},
+    )
+    report["want"] = tuple(args)
+    flush_reports()
+
+
+def reports_pending():
+    return any(report["want"] != report["sent"] for report in reports.values())
+
+
+def flush_reports():
+    """Send each report whose wanted value changed. One process per kind at a time."""
+    if give_up:
+        return
+    now = time.monotonic()
+    for kind, report in reports.items():
+        if report["hook"] or report["want"] == report["sent"] or now < report["retry_at"]:
+            continue
+        args = report["want"] + ("--seq", str(next_seq()))
+        hook = start_process(herdr_bin(), args, "report_cb", kind)
+        if not hook:
+            give_up_binary()
+            return
+        report["hook"] = hook
+        report["inflight"] = report["want"]
+    if reports_pending():
+        ensure_timer()
+
+
+def report_cb(data, command, return_code, out, err):
+    report = reports.get(data)
+    if report is None or process_status(return_code) == "running":
+        return weechat.WEECHAT_RC_OK
+    report["hook"] = ""
+    # The CLI exits 0 when Herdr accepted the report, 1 when Herdr returned an error.
+    if process_status(return_code) == "done" and exit_code(return_code) == 0:
+        report["sent"] = report["inflight"]
+        report["failures"] = 0
+    elif report["failures"] < retry_limit():
+        report["failures"] += 1
+        report["retry_at"] = time.monotonic() + RETRY_SECONDS
+    else:
+        detail = " ".join((err or out or "no reply").split())[:200]
+        log_once("report-" + data, "Herdr did not accept the %s report: %s" % (data, detail))
+        report["sent"] = report["inflight"]
+        report["failures"] = 0
+    flush_reports()
+    stop_timer_if_idle()
+    return weechat.WEECHAT_RC_OK
+
+
+def release_agent():
+    """Runs at unload, where a hooked process would be killed before it finishes."""
+    pane_id = our_pane_id()
+    if not pane_id or give_up:
+        return
+    args = ["pane", "release-agent", pane_id, "--source", AGENT_SOURCE, "--agent", AGENT_LABEL]
+    try:
+        subprocess.run(
+            [herdr_bin()] + args + ["--seq", str(next_seq())],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def consider_send():
@@ -790,14 +911,18 @@ def start_focus_query():
     focus_hook = hook
 
 
-def notify_invocation(title, body, sound):
+def notifier_binary():
+    """The terminal-notifier to post with, or "" when Herdr's own alert is used."""
     binary = notifier_path()
     delivery = setting("delivery")
-    backend = backend_name(delivery, sys.platform, binary, prefer_herdr)
     if delivery_mode(delivery) == "terminal-notifier" and not binary:
         log_once("notifier-missing", NOTIFIER_MISSING)
-    if backend != "terminal-notifier":
-        return "herdr", herdr_bin(), herdr_notify_args(title, body, sound)
+    if backend_name(delivery, sys.platform, binary, prefer_herdr) != "terminal-notifier":
+        return ""
+    return binary
+
+
+def notifier_invocation(binary, title, body, sound):
     bundle = chosen_bundle(setting("terminal_bundle"), os.environ)
     socket_path = os.environ.get("HERDR_SOCKET_PATH", "").strip()
     python = python_bin()
@@ -812,46 +937,43 @@ def notify_invocation(title, body, sound):
             "notifier-python",
             "python3 was not found, so clicking the notification cannot focus this pane.",
         )
-    return (
-        "terminal-notifier",
-        binary,
-        notifier_arguments(
-            title,
-            body,
-            macos_sound(sound),
-            notification_group(our_pane_id()),
-            bundle,
-            execute,
-        ),
+    return notifier_arguments(
+        title,
+        body,
+        macos_sound(sound),
+        notification_group(our_pane_id()),
+        bundle,
+        execute,
     )
 
 
 def start_notify(events):
-    global notify_hook, inflight_ids, inflight_backend, prefer_herdr, next_attempt
+    """Herdr alerts on the blocked report itself; macOS also gets a banner first."""
+    global notify_hook, inflight_ids, prefer_herdr, next_attempt
+    binary = notifier_binary()
+    if not binary:
+        deliver(events)
+        return
     title = choose_title(events) or "WeeChat"
-    body = choose_body(events)
-    backend, command, args = notify_invocation(title, body, choose_sound(events))
-    inflight_backend = backend
+    args = notifier_invocation(binary, title, choose_body(events), choose_sound(events))
     notify_output["out"] = ""
     notify_output["err"] = ""
     inflight_ids = [event.id for event in events]
-    hook = start_process(command, args, "notify_cb")
+    hook = start_process(binary, args, "notify_cb")
     if hook:
         notify_hook = hook
         return
     inflight_ids = []
-    if backend == "terminal-notifier":
-        prefer_herdr = True
-        next_attempt = 0.0
-        log_once("notifier-missing", NOTIFIER_MISSING)
-        return
-    give_up_binary()
+    prefer_herdr = True
+    next_attempt = 0.0
+    log_once("notifier-missing", NOTIFIER_MISSING)
 
 
 def give_up_binary():
     global give_up
     give_up = True
     queued.clear()
+    unread.clear()
     restore_beep()
     log_once("binary", "could not run %s. Is it on PATH?" % herdr_bin())
     clear_title()
@@ -880,7 +1002,10 @@ def command_cb(data, buffer, args):
     global outer_focused
     arg = (args or "").strip()
     if arg == "focus":
+        # Herdr forwards focus-in only to the focused pane, so the buffers on
+        # screen in this WeeChat are now in front of the user.
         outer_focused = True
+        mark_seen({event.buffer for event in unread if buffer_on_screen(event.buffer)})
         now = time.monotonic()
         for event in queued:
             if event.buffer == buffer:
@@ -902,6 +1027,7 @@ def message_cb(data, buffer, date, tags, displayed, highlight, prefix, message):
 
 
 def buffer_switch_cb(data, signal, buffer):
+    mark_seen({buffer})
     now = time.monotonic()
     matched = False
     for event in queued:
@@ -921,6 +1047,8 @@ def buffer_closing_cb(data, signal, buffer):
 
 def timer_cb(data, remaining):
     consider_send()
+    flush_reports()
+    stop_timer_if_idle()
     return weechat.WEECHAT_RC_OK
 
 
@@ -958,7 +1086,7 @@ def exit_code(return_code):
 
 
 def notifier_finished(status, return_code, err, out=""):
-    """A terminal-notifier failure falls back to Herdr toasts. The events stay queued."""
+    """A terminal-notifier failure falls back to Herdr's own alert. The events stay queued."""
     global prefer_herdr, notify_failures, next_attempt
     if status != "error":
         code = exit_code(return_code)
@@ -981,7 +1109,8 @@ def notifier_finished(status, return_code, err, out=""):
 
 
 def notify_cb(data, command, return_code, out, err):
-    global notify_hook, notify_failures, next_attempt, give_up, inflight_ids
+    """terminal-notifier finished. A failure leaves the events queued for Herdr."""
+    global notify_hook, inflight_ids
     status = process_status(return_code)
     notify_output["out"] += out or ""
     notify_output["err"] += err or ""
@@ -994,47 +1123,9 @@ def notify_cb(data, command, return_code, out, err):
     captured_err = notify_output["err"]
     notify_output["out"] = ""
     notify_output["err"] = ""
-    if inflight_backend == "terminal-notifier":
-        outcome = notifier_finished(status, return_code, captured_err, captured_out)
-        if outcome == "shown":
-            forget(sent_ids)
-            refresh_title()
-            stop_timer_if_idle()
-        return weechat.WEECHAT_RC_OK
-
-    # WeeChat reports a killed (timed-out) process as an error. Herdr may only
-    # be slow, so that is retried like "busy" instead of ending the script.
-    if status == "error":
-        reason = "timeout"
-    else:
-        reason = notification_reason(parse_json(captured_out) or {})
-    if reason == "shown":
-        notify_failures = 0
-        forget(sent_ids)
-        refresh_title()
-        stop_timer_if_idle()
-        return weechat.WEECHAT_RC_OK
-    if reason == "disabled":
-        give_up = True
-        forget(sent_ids)
-        restore_beep()
-        log_once("disabled", TOAST_SNIPPET)
-        refresh_title()
-        stop_timer_if_idle()
-        return weechat.WEECHAT_RC_OK
-
-    notify_failures += 1
-    next_attempt = time.monotonic() + RETRY_SECONDS
-    if reason in RETRY_REASONS and notify_failures <= retry_limit():
-        stop_timer_if_idle()
-        return weechat.WEECHAT_RC_OK
-    forget(sent_ids)
-    notify_failures = 0
-    if reason in RETRY_REASONS:
-        log_once("retry", "Herdr did not show a notification (%s)." % (reason or "unknown"))
-    else:
-        log_once("notify", "Herdr rejected a notification (%s)." % reason)
-    refresh_title()
+    outcome = notifier_finished(status, return_code, captured_err, captured_out)
+    if outcome == "shown":
+        deliver([event for event in queued if event.id in sent_ids])
     stop_timer_if_idle()
     return weechat.WEECHAT_RC_OK
 
@@ -1043,6 +1134,7 @@ def shutdown_cb():
     restore_beep()
     if our_pane_id():
         set_focus_reporting(False)
+        release_agent()
     unbind_focus_keys()
     clear_title()
     return weechat.WEECHAT_RC_OK
@@ -1085,6 +1177,8 @@ def register():
     )
     weechat.hook_signal("buffer_switch", "buffer_switch_cb", "")
     weechat.hook_signal("buffer_closing", "buffer_closing_cb", "")
+    # Start idle, which also clears a blocked state left by a crash.
+    sync_agent()
 
 
 if weechat is not None:
