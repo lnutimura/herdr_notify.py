@@ -388,8 +388,16 @@ class CallbackTests(unittest.TestCase):
 
     def setUp(self):
         self.weechat = FakeWeechat()
-        self.saved_pane = os.environ.get("HERDR_PANE_ID")
-        os.environ["HERDR_PANE_ID"] = "w1:p1"
+        # The pane's environment, as Herdr sets it, independent of the shell running the tests.
+        environ = mock.patch.dict(
+            os.environ,
+            {"HERDR_PANE_ID": "w1:p1", "HERDR_SOCKET_PATH": "/run/herdr.sock", "HERDR_BIN_PATH": "herdr"},
+        )
+        environ.start()
+        self.addCleanup(environ.stop)
+        python = mock.patch.object(notify, "python_bin", return_value="/usr/bin/python3")
+        python.start()
+        self.addCleanup(python.stop)
         notify.weechat = self.weechat
         notify.queued = []
         notify.unread = []
@@ -413,10 +421,6 @@ class CallbackTests(unittest.TestCase):
 
     def tearDown(self):
         notify.weechat = None
-        if self.saved_pane is None:
-            os.environ.pop("HERDR_PANE_ID", None)
-        else:
-            os.environ["HERDR_PANE_ID"] = self.saved_pane
 
     def queue_due_highlight(self, buffer="#chan"):
         notify.enqueue(buffer, "ada", "hello", "highlight")
