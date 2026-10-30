@@ -165,6 +165,8 @@ class Event:
     text: str
     kind: str
     due: float
+    # WeeChat's full buffer name (irc.libera.#chan), for /buffer on click.
+    full_name: str = ""
 
 
 def setting(name):
@@ -345,9 +347,14 @@ def choose_title(events):
     return sanitize(title, TITLE_LIMIT)
 
 
-def choose_body(events):
+def featured_event(events):
+    """The latest mention if there is one, else the latest line."""
     highlights = [event for event in events if event.kind == "highlight"]
-    chosen = highlights[-1] if highlights else events[-1]
+    return highlights[-1] if highlights else events[-1]
+
+
+def choose_body(events):
+    chosen = featured_event(events)
     if len(events) == 1:
         return sanitize(chosen.text, body_limit())
     if chosen.nick and chosen.text:
@@ -460,8 +467,41 @@ def shell_quote(text):
     return "'" + str(text).replace("'", "'\\''") + "'"
 
 
-def focus_python(pane_id):
-    """Herdr's CLI focuses a neighbor, not an arbitrary pane. pane.focus does."""
+FOCUS_PROGRAM = """\
+import os, socket
+if FIFO:
+    try:
+        fd = os.open(FIFO, os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            os.write(fd, LINE)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(5)
+s.connect(os.environ["HERDR_SOCKET_PATH"])
+s.sendall(REQUEST)
+s.recv(65536)
+"""
+
+
+def fifo_line(full_name):
+    """A WeeChat fifo line that switches to the buffer, or b"" when the name is unsafe.
+
+    The fifo runs one command per line, and ';' or a backslash could change
+    what /buffer receives, so such names are not switched to.
+    """
+    if not full_name or any(ch in full_name for ch in ";\\") or not full_name.isprintable():
+        return b""
+    return ("*/buffer %s\n" % full_name).encode("utf-8")
+
+
+def focus_python(pane_id, fifo="", full_name=""):
+    """Herdr's CLI focuses a neighbor, not an arbitrary pane. pane.focus does.
+
+    The program is one exec() call, so it fits on a single command line.
+    """
     payload = json.dumps(
         {
             "id": "herdr-notify:focus",
@@ -470,14 +510,12 @@ def focus_python(pane_id):
         },
         separators=(",", ":"),
     )
-    return (
-        "import os,socket;"
-        "s=socket.socket(socket.AF_UNIX);"
-        "s.settimeout(5);"
-        "s.connect(os.environ['HERDR_SOCKET_PATH']);"
-        "s.sendall(%s);"
-        "s.recv(65536)"
-    ) % repr((payload + "\n").encode("utf-8"))
+    line = fifo_line(full_name)
+    program = (
+        "FIFO = %r\nLINE = %r\nREQUEST = %r\n" % (fifo if line else "", line, (payload + "\n").encode("utf-8"))
+        + FOCUS_PROGRAM
+    )
+    return "exec(%r)" % program
 
 
 def resolve_python(executable, which, usable):
@@ -500,13 +538,13 @@ def python_bin():
     return resolve_python(sys.executable, shutil.which, usable)
 
 
-def focus_command(python, socket_path, pane_id):
+def focus_command(python, socket_path, pane_id, fifo="", full_name=""):
     if not python or not socket_path or not pane_id:
         return ""
     return "HERDR_SOCKET_PATH=%s %s -c %s" % (
         shell_quote(socket_path),
         shell_quote(python),
-        shell_quote(focus_python(pane_id)),
+        shell_quote(focus_python(pane_id, fifo, full_name)),
     )
 
 
@@ -531,8 +569,7 @@ def unread_summary(events):
     """One line for Herdr: the latest mention if there is one, else the latest line."""
     if not events:
         return ""
-    highlights = [event for event in events if event.kind == "highlight"]
-    latest = highlights[-1] if highlights else events[-1]
+    latest = featured_event(events)
     where = latest.name or "WeeChat"
     if latest.nick:
         line = "%s in %s: %s" % (latest.nick, where, latest.text)
@@ -921,11 +958,13 @@ def notifier_binary():
     return binary
 
 
-def notifier_invocation(binary, title, body, sound):
+def notifier_invocation(binary, title, body, sound, full_name=""):
     bundle = chosen_bundle(setting("terminal_bundle"), os.environ)
     socket_path = os.environ.get("HERDR_SOCKET_PATH", "").strip()
     python = python_bin()
-    execute = focus_command(python, socket_path, our_pane_id())
+    # Empty when the fifo plugin is not loaded; the click then only focuses the pane.
+    fifo = weechat.info_get("fifo_filename", "")
+    execute = focus_command(python, socket_path, our_pane_id(), fifo, full_name)
     if not socket_path:
         log_once(
             "notifier-focus",
@@ -954,7 +993,8 @@ def start_notify(events):
         deliver(events)
         return
     title = choose_title(events) or "WeeChat"
-    args = notifier_invocation(binary, title, choose_body(events), choose_sound(events))
+    target = featured_event(events).full_name
+    args = notifier_invocation(binary, title, choose_body(events), choose_sound(events), target)
     notify_output["out"] = ""
     notify_output["err"] = ""
     inflight_ids = [event.id for event in events]
@@ -989,6 +1029,7 @@ def enqueue(buffer, nick, text, kind):
             sanitize(text, TEXT_LIMIT),
             kind,
             time.monotonic() + delay_seconds(),
+            weechat.buffer_get_string(buffer, "full_name"),
         )
     )
     next_id += 1

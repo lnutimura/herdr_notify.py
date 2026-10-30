@@ -5,7 +5,11 @@ import importlib.util
 import os
 import pathlib
 import shutil
+import socket
 import subprocess
+import sys
+import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -278,6 +282,42 @@ class NotifierTests(unittest.TestCase):
         subprocess.check_call(["sh", "-c", command])
         self.assertEqual(notify.focus_command("", "/tmp/sock", "w1:p3"), "")
 
+    def test_fifo_line_switches_buffer_only_for_safe_names(self):
+        self.assertEqual(notify.fifo_line("irc.libera.#weechat"), b"*/buffer irc.libera.#weechat\n")
+        self.assertEqual(notify.fifo_line("irc.libera.#a;/quit"), b"")
+        self.assertEqual(notify.fifo_line("irc.libera.#a\n/quit"), b"")
+        self.assertEqual(notify.fifo_line(""), b"")
+
+    def test_click_switches_the_buffer_and_focuses_the_pane(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fifo = os.path.join(tmp, "weechat_fifo")
+            os.mkfifo(fifo)
+            # WeeChat keeps its fifo open like this, so a non-blocking writer finds a reader.
+            reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+            sock_path = os.path.join(tmp, "herdr.sock")
+            server = socket.socket(socket.AF_UNIX)
+            server.bind(sock_path)
+            server.listen(1)
+            received = {}
+
+            def serve():
+                conn, _ = server.accept()
+                received["request"] = conn.recv(65536)
+                conn.sendall(b"{}\n")
+                conn.close()
+
+            thread = threading.Thread(target=serve)
+            thread.start()
+            command = notify.focus_command(sys.executable, sock_path, "w1:p3", fifo, "irc.libera.#chan")
+            subprocess.check_call(["sh", "-c", command], timeout=10)
+            thread.join(5)
+            line = os.read(reader, 4096)
+            os.close(reader)
+            server.close()
+        self.assertEqual(line, b"*/buffer irc.libera.#chan\n")
+        self.assertIn(b'"pane.focus"', received["request"])
+        self.assertIn(b"w1:p3", received["request"])
+
     def test_notifier_failure_keeps_the_events_and_falls_back(self):
         notify.prefer_herdr = False
         notify.notify_failures = 0
@@ -306,6 +346,7 @@ class FakeWeechat:
         self.processes = []
         self.process_starts = True
         self.displayed = {}
+        self.fifo = "/run/weechat_fifo"
 
     def config_get_plugin(self, name):
         return self.options.get(name, "")
@@ -337,6 +378,9 @@ class FakeWeechat:
 
     def buffer_get_string(self, buffer, name):
         return buffer
+
+    def info_get(self, name, arguments):
+        return self.fifo if name == "fifo_filename" else ""
 
 
 class CallbackTests(unittest.TestCase):
@@ -512,6 +556,9 @@ class CallbackTests(unittest.TestCase):
             notify.consider_send()
             command, args, callback, _data = self.last_process()
             self.assertEqual((command, callback), ("/bin/terminal-notifier", "notify_cb"))
+            execute = args[args.index("-execute") + 1]
+            self.assertIn("/run/weechat_fifo", execute)
+            self.assertIn("*/buffer #chan", execute)
             self.assertEqual(notify.unread, [])
             notify.notify_cb("", command, 0, "", "")
         self.assertEqual(self.agent_state(self.last_agent_report()), "blocked")
