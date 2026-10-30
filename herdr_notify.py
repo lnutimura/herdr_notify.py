@@ -29,7 +29,7 @@
 #   delay            seconds to wait before notifying
 #   sound_highlight  none | done | request (macOS banners)
 #   sound_message    none | done | request (macOS banners)
-#   title_badge      on | off
+#   title_badge      on | off (sidebar tokens $weechat_unread, $summary)
 #   max_body_length  banner body cap; 0 leaves the cap to macOS
 #   retry_limit      attempts for a banner or a Herdr report
 #   delivery         auto | herdr | terminal-notifier
@@ -60,7 +60,7 @@ SETTINGS = (
     ("delay", "3", "seconds to wait before notifying, so a buffer you open stays quiet"),
     ("sound_highlight", "request", "macOS banner sound for a mention or private message: none, done, or request"),
     ("sound_message", "none", "macOS banner sound for other channel messages: none, done, or request"),
-    ("title_badge", "on", "on or off; write the unread summary into the terminal title"),
+    ("title_badge", "on", "on or off; publish the unread count and summary as Herdr sidebar tokens"),
     ("max_body_length", "240", "maximum macOS banner body length; 0 leaves the limit to macOS"),
     ("retry_limit", "30", "how many times to retry a macOS banner or a report to Herdr"),
     (
@@ -91,6 +91,10 @@ NOTIFY_HIGHLIGHT = 1
 # How this script appears to Herdr. Herdr reserves the "herdr:" prefix.
 AGENT_SOURCE = "custom:weechat"
 AGENT_LABEL = "weechat"
+# Sidebar tokens come from a separate source, as Herdr's docs do it.
+METADATA_SOURCE = "custom:weechat-display"
+# Herdr's maximum. Tokens disappear by themselves if WeeChat dies.
+METADATA_TTL_MS = 86400000
 NOTIFIER_CANDIDATES = (
     "/opt/homebrew/bin/terminal-notifier",
     "/usr/local/bin/terminal-notifier",
@@ -147,7 +151,6 @@ give_up = False
 beep_suspended = False
 logged = set()
 outer_focused = True
-title_current = None
 bound_keys = []
 
 
@@ -360,14 +363,6 @@ def choose_sound(events):
     return sound_choice("sound_message")
 
 
-def badge_summary(events):
-    if not events:
-        return ""
-    if events[-1].name:
-        return sanitize("weechat (%d) %s" % (len(events), events[-1].name), TITLE_LIMIT)
-    return sanitize("weechat (%d)" % len(events), TITLE_LIMIT)
-
-
 def delivery_mode(value):
     return (value or "auto").strip().lower().replace("_", "-")
 
@@ -548,6 +543,18 @@ def unread_summary(events):
     return sanitize(line, TITLE_LIMIT)
 
 
+def metadata_report_args(pane_id, events):
+    args = ["pane", "report-metadata", pane_id, "--source", METADATA_SOURCE]
+    if not events:
+        return tuple(args + ["--clear-token", "weechat_unread", "--clear-token", "summary"])
+    return tuple(
+        args
+        + ["--token", "weechat_unread=%d" % len(events)]
+        + ["--token", "summary=" + unread_summary(events)]
+        + ["--ttl-ms", str(METADATA_TTL_MS)]
+    )
+
+
 def agent_report_args(pane_id, events):
     """blocked makes Herdr mark the pane, toast and play its request sound."""
     args = ["pane", "report-agent", pane_id, "--source", AGENT_SOURCE, "--agent", AGENT_LABEL]
@@ -656,24 +663,12 @@ def set_focus_reporting(enabled):
     weechat.command("", stdout_command("\x1b[?1004%s\n" % ("h" if enabled else "l")))
 
 
-def set_terminal_title(text):
-    global title_current
-    if text == title_current:
-        return
-    title_current = text
-    safe = "".join(ch if ch.isalnum() or ch in " #@()[]-_.,+/" else " " for ch in text)
-    safe = " ".join(safe.split())
-    weechat.command("", stdout_command("\x1b]0;%s\x07" % safe))
-
-
-def refresh_title():
-    if title_badge_enabled():
-        set_terminal_title(badge_summary(queued))
-
-
-def clear_title():
-    if title_current:
-        set_terminal_title("weechat")
+def refresh_badge():
+    """Unread and pending lines, as sidebar tokens. Off clears them."""
+    pane_id = our_pane_id()
+    if pane_id:
+        events = unread + queued if title_badge_enabled() else []
+        want_report("metadata", metadata_report_args(pane_id, events))
 
 
 def ensure_timer():
@@ -707,7 +702,7 @@ def drop_buffer(buffer):
     before = len(queued)
     queued = [event for event in queued if event.buffer != buffer]
     if len(queued) != before:
-        refresh_title()
+        refresh_badge()
     mark_seen({buffer})
     stop_timer_if_idle()
 
@@ -782,7 +777,7 @@ def deliver(events):
     """The user has been alerted about these lines; they stay unread until seen."""
     forget({event.id for event in events})
     unread.extend(events)
-    refresh_title()
+    refresh_badge()
     sync_agent()
 
 
@@ -793,6 +788,7 @@ def mark_seen(buffers):
     before = len(unread)
     unread = [event for event in unread if event.buffer not in buffers]
     if len(unread) != before:
+        refresh_badge()
         sync_agent()
 
 
@@ -861,10 +857,14 @@ def release_agent():
     pane_id = our_pane_id()
     if not pane_id or give_up:
         return
-    args = ["pane", "release-agent", pane_id, "--source", AGENT_SOURCE, "--agent", AGENT_LABEL]
+    run_now(metadata_report_args(pane_id, []))
+    run_now(("pane", "release-agent", pane_id, "--source", AGENT_SOURCE, "--agent", AGENT_LABEL))
+
+
+def run_now(args):
     try:
         subprocess.run(
-            [herdr_bin()] + args + ["--seq", str(next_seq())],
+            [herdr_bin()] + list(args) + ["--seq", str(next_seq())],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -878,7 +878,6 @@ def release_agent():
 def consider_send():
     if give_up:
         queued.clear()
-        clear_title()
         stop_timer_if_idle()
         return
     now = time.monotonic()
@@ -891,7 +890,7 @@ def consider_send():
         start_focus_query()
         return
     drop_visible(now, focus_cache["pane_id"])
-    refresh_title()
+    refresh_badge()
     ready = due_events(now)
     if not ready:
         stop_timer_if_idle()
@@ -976,7 +975,6 @@ def give_up_binary():
     unread.clear()
     restore_beep()
     log_once("binary", "could not run %s. Is it on PATH?" % herdr_bin())
-    clear_title()
     stop_timer_if_idle()
 
 
@@ -994,7 +992,7 @@ def enqueue(buffer, nick, text, kind):
         )
     )
     next_id += 1
-    refresh_title()
+    refresh_badge()
     ensure_timer()
 
 
@@ -1136,7 +1134,6 @@ def shutdown_cb():
         set_focus_reporting(False)
         release_agent()
     unbind_focus_keys()
-    clear_title()
     return weechat.WEECHAT_RC_OK
 
 
@@ -1177,8 +1174,9 @@ def register():
     )
     weechat.hook_signal("buffer_switch", "buffer_switch_cb", "")
     weechat.hook_signal("buffer_closing", "buffer_closing_cb", "")
-    # Start idle, which also clears a blocked state left by a crash.
+    # Start idle and empty, which also clears what a crash left behind.
     sync_agent()
+    refresh_badge()
 
 
 if weechat is not None:

@@ -148,10 +148,14 @@ class ToastTests(unittest.TestCase):
         ]
         self.assertEqual(notify.choose_title(events), "3 messages")
 
-    def test_badge_names_the_latest_buffer(self):
+    def test_badge_is_a_pair_of_sidebar_tokens(self):
         events = [event("message", "#chan", "ada", "hi")]
-        self.assertEqual(notify.badge_summary(events), "weechat (1) #chan")
-        self.assertEqual(notify.badge_summary([]), "")
+        args = notify.metadata_report_args("w1:p1", events)
+        self.assertEqual(args[:5], ("pane", "report-metadata", "w1:p1", "--source", "custom:weechat-display"))
+        self.assertIn("weechat_unread=1", args)
+        self.assertIn("summary=ada in #chan: hi", args)
+        cleared = notify.metadata_report_args("w1:p1", [])
+        self.assertEqual(cleared[-4:], ("--clear-token", "weechat_unread", "--clear-token", "summary"))
 
     def test_unread_summary_prefers_the_latest_mention(self):
         events = [
@@ -361,7 +365,6 @@ class CallbackTests(unittest.TestCase):
         notify.beep_suspended = False
         notify.logged = set()
         notify.outer_focused = True
-        notify.title_current = None
         notify.bound_keys = []
 
     def tearDown(self):
@@ -383,10 +386,14 @@ class CallbackTests(unittest.TestCase):
         command, args, timeout, callback, data = self.weechat.processes[-1]
         return command, args, callback, data
 
-    def finish_last_report(self, code=0):
-        _command, _args, callback, data = self.last_process()
-        self.assertEqual(callback, "report_cb")
-        notify.report_cb(data, "herdr", code, "", "")
+    def agent_reports(self):
+        return [args for _command, args, _timeout, _callback, data in self.weechat.processes if data == "agent"]
+
+    def last_agent_report(self):
+        return self.agent_reports()[-1]
+
+    def finish_report(self, kind="agent", code=0):
+        notify.report_cb(kind, "herdr", code, "", "")
 
     def agent_state(self, args):
         return args[args.index("--state") + 1]
@@ -395,7 +402,7 @@ class CallbackTests(unittest.TestCase):
         self.queue_due_highlight()
         self.focus_on("w1:p2")
         notify.consider_send()
-        command, args, callback, _data = self.last_process()
+        args = self.last_agent_report()
         self.assertEqual(args[:3], ["pane", "report-agent", "w1:p1"])
         self.assertEqual(self.agent_state(args), "blocked")
         self.assertEqual(args[args.index("--message") + 1], "ada in #chan: hello")
@@ -408,9 +415,9 @@ class CallbackTests(unittest.TestCase):
         self.queue_due_highlight()
         self.focus_on("w1:p2")
         notify.consider_send()
-        self.finish_last_report()
+        self.finish_report()
         notify.buffer_switch_cb("", "buffer_switch", "#chan")
-        _command, args, _callback, _data = self.last_process()
+        args = self.last_agent_report()
         self.assertEqual(self.agent_state(args), "idle")
         self.assertNotIn("--message", args)
         self.assertEqual(notify.unread, [])
@@ -420,38 +427,48 @@ class CallbackTests(unittest.TestCase):
         notify.unread[0].buffer = "#chan"
         self.weechat.displayed["#chan"] = 1
         notify.command_cb("", "#chan", "focus")
-        _command, args, _callback, _data = self.last_process()
-        self.assertEqual(self.agent_state(args), "idle")
+        self.assertEqual(self.agent_state(self.last_agent_report()), "idle")
 
     def test_a_change_during_a_report_is_sent_after_it(self):
         self.queue_due_highlight()
         self.focus_on("w1:p2")
         notify.consider_send()
         notify.buffer_switch_cb("", "buffer_switch", "#chan")
-        self.assertEqual(len(self.weechat.processes), 1)
-        self.finish_last_report()
-        self.assertEqual(len(self.weechat.processes), 2)
-        self.assertEqual(self.agent_state(self.last_process()[1]), "idle")
+        self.assertEqual(len(self.agent_reports()), 1)
+        self.finish_report()
+        self.assertEqual(len(self.agent_reports()), 2)
+        self.assertEqual(self.agent_state(self.last_agent_report()), "idle")
 
     def test_failed_report_is_retried(self):
         self.queue_due_highlight()
         self.focus_on("w1:p2")
         notify.consider_send()
-        self.finish_last_report(code=1)
-        self.assertEqual(len(self.weechat.processes), 1)
+        self.finish_report(code=1)
+        self.assertEqual(len(self.agent_reports()), 1)
         self.assertTrue(notify.reports_pending())
         notify.reports["agent"]["retry_at"] = 0.0
         notify.timer_cb("", 0)
-        self.assertEqual(len(self.weechat.processes), 2)
-        self.assertEqual(self.agent_state(self.last_process()[1]), "blocked")
+        self.assertEqual(len(self.agent_reports()), 2)
+        self.assertEqual(self.agent_state(self.last_agent_report()), "blocked")
+
+    def test_badge_tokens_follow_the_unread_lines(self):
+        def metadata_reports():
+            return [args for _c, args, _t, _cb, data in self.weechat.processes if data == "metadata"]
+
+        self.queue_due_highlight()
+        self.assertIn("weechat_unread=1", metadata_reports()[-1])
+        self.focus_on("w1:p2")
+        notify.consider_send()
+        self.finish_report("metadata")
+        notify.buffer_switch_cb("", "buffer_switch", "#chan")
+        self.assertIn("--clear-token", metadata_reports()[-1])
 
     def test_missing_binary_gives_up_and_restores_beep(self):
         self.weechat.options["beep_suspended"] = "on"
         self.weechat.process_starts = False
-        self.queue_due_highlight()
-        self.focus_on("w1:p2")
-        notify.consider_send()
+        notify.enqueue("#chan", "ada", "hello", "highlight")
         self.assertTrue(notify.give_up)
+        self.assertEqual(notify.queued, [])
         self.assertIn("/mute /trigger enable beep", self.weechat.commands)
         self.assertEqual(self.weechat.options["beep_suspended"], "off")
 
@@ -468,7 +485,7 @@ class CallbackTests(unittest.TestCase):
         notify.focus_cb("", command, running, snapshot[:65536], "")
         notify.focus_cb("", command, 0, snapshot[65536:], "")
         self.assertEqual(notify.focus_cache["pane_id"], "w1:p2")
-        self.assertEqual(self.last_process()[1][:2], ["pane", "report-agent"])
+        self.assertEqual(self.agent_state(self.last_agent_report()), "blocked")
 
     def test_visible_buffer_in_focused_pane_is_not_reported(self):
         self.weechat.displayed["#chan"] = 1
@@ -477,7 +494,7 @@ class CallbackTests(unittest.TestCase):
         notify.consider_send()
         self.assertEqual(notify.queued, [])
         self.assertEqual(notify.unread, [])
-        self.assertEqual(self.weechat.processes, [])
+        self.assertEqual(self.agent_reports(), [])
 
     def test_switching_to_the_buffer_silences_it(self):
         notify.enqueue("#chan", "ada", "hello", "highlight")
@@ -485,7 +502,7 @@ class CallbackTests(unittest.TestCase):
         self.focus_on("w1:p1")
         notify.buffer_switch_cb("", "buffer_switch", "#chan")
         self.assertEqual(notify.queued, [])
-        self.assertEqual(self.weechat.processes, [])
+        self.assertEqual(self.agent_reports(), [])
 
     def test_banner_is_shown_before_the_blocked_report(self):
         self.weechat.options["delivery"] = "terminal-notifier"
@@ -497,7 +514,7 @@ class CallbackTests(unittest.TestCase):
             self.assertEqual((command, callback), ("/bin/terminal-notifier", "notify_cb"))
             self.assertEqual(notify.unread, [])
             notify.notify_cb("", command, 0, "", "")
-        self.assertEqual(self.agent_state(self.last_process()[1]), "blocked")
+        self.assertEqual(self.agent_state(self.last_agent_report()), "blocked")
         self.assertEqual(notify.queued, [])
 
     def test_banner_failure_falls_back_to_herdr(self):
@@ -511,13 +528,13 @@ class CallbackTests(unittest.TestCase):
             self.assertEqual(len(notify.queued), 1)
             self.focus_on("w1:p2")
             notify.consider_send()
-        self.assertEqual(self.agent_state(self.last_process()[1]), "blocked")
+        self.assertEqual(self.agent_state(self.last_agent_report()), "blocked")
 
     def test_shutdown_releases_the_agent_and_focus_reporting(self):
         with mock.patch.object(notify.subprocess, "run") as run:
             notify.shutdown_cb()
-        args = run.call_args[0][0]
-        self.assertEqual(args[1:4], ["pane", "release-agent", "w1:p1"])
+        calls = [call[0][0][1:4] for call in run.call_args_list]
+        self.assertEqual(calls, [["pane", "report-metadata", "w1:p1"], ["pane", "release-agent", "w1:p1"]])
         self.assertTrue(any("?1004l" in command for command in self.weechat.commands))
 
 
